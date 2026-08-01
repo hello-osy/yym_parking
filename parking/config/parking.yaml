@@ -26,6 +26,22 @@ parking_node:
     lidar.boundary_band: 0.12
     lidar.minimum_confidence: 0.35
 
+    # Safety-sector-only self-return suppression.  These coordinates are the
+    # measured narrow reflection cluster; slot detection remains unmasked.
+    lidar.left_side_x_min: -0.75
+    lidar.left_side_x_max: 0.60
+    lidar.left_side_y_min: 0.10
+    lidar.left_side_y_max: 1.25
+    lidar.left_side_hard_stop_distance: 0.20
+    lidar_safety.self_mask.enabled: true
+    lidar_safety.self_mask.region.name: lidar_front_left_self_return
+    lidar_safety.self_mask.region.x_min: 0.04
+    lidar_safety.self_mask.region.x_max: 0.13
+    lidar_safety.self_mask.region.y_min: 0.11
+    lidar_safety.self_mask.region.y_max: 0.18
+    lidar_safety.self_mask.region.reason: >-
+      persistent self return near x=0.085 y=0.145 from replay analysis
+
     fusion.history_size: 8
     fusion.required_count: 5
     fusion.minimum_confidence: 0.45

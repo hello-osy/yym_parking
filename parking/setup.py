@@ -1,3 +1,5 @@
+from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = "parking"
@@ -13,7 +15,7 @@ setup(
         ),
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/config", ["config/parking.yaml"]),
-        ("share/" + package_name + "/launch", ["launch/parking.launch.py"]),
+        ("share/" + package_name + "/launch", glob("launch/*.launch.py")),
     ],
     install_requires=["setuptools", "numpy"],
     zip_safe=True,

@@ -4,6 +4,7 @@ import math
 import time
 from typing import Optional
 
+import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
@@ -16,7 +17,8 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from .camera_assist import CameraAssist, CameraAssistConfig
 from .geometry import transform_points_2d
 from .lidar_slot_detector import LidarDetectorConfig, LidarSlotDetector
-from .models import SlotEstimate, SlotSide
+from .lidar_safety import LidarSafetySelfMask, SelfMaskRegion
+from .models import SafetyDecision, SlotEstimate, SlotSide
 from .parking_fsm import ParkingFSM, ParkingFSMConfig
 from .slot_fusion import SlotFusion, SlotFusionConfig
 from .ultrasonic_safety import (
@@ -246,6 +248,62 @@ class ParkingNode(Node):
             )
         )
 
+        # This mask is intentionally used only by the left-side safety-sector
+        # query below.  Slot detection always receives the unmasked scan.
+        self.left_side_sector = (
+            float(self._p("lidar.left_side_x_min", -0.75)),
+            float(self._p("lidar.left_side_x_max", 0.60)),
+            float(self._p("lidar.left_side_y_min", 0.10)),
+            float(self._p("lidar.left_side_y_max", 1.25)),
+        )
+        self.left_side_hard_stop_distance = float(
+            self._p("lidar.left_side_hard_stop_distance", 0.20)
+        )
+        self.lidar_self_mask = LidarSafetySelfMask(
+            bool(self._p("lidar_safety.self_mask.enabled", True)),
+            (
+                SelfMaskRegion(
+                    name=str(
+                        self._p(
+                            "lidar_safety.self_mask.region.name",
+                            "lidar_front_left_self_return",
+                        )
+                    ),
+                    x_min=float(
+                        self._p(
+                            "lidar_safety.self_mask.region.x_min", 0.04
+                        )
+                    ),
+                    x_max=float(
+                        self._p(
+                            "lidar_safety.self_mask.region.x_max", 0.13
+                        )
+                    ),
+                    y_min=float(
+                        self._p(
+                            "lidar_safety.self_mask.region.y_min", 0.11
+                        )
+                    ),
+                    y_max=float(
+                        self._p(
+                            "lidar_safety.self_mask.region.y_max", 0.18
+                        )
+                    ),
+                    reason=str(
+                        self._p(
+                            "lidar_safety.self_mask.region.reason",
+                            "persistent replay self return near x=0.085 y=0.145",
+                        )
+                    ),
+                ),
+            ),
+        )
+        self.left_side_lidar_minimum_before_mask = math.inf
+        self.left_side_lidar_minimum_after_mask = math.inf
+        self.left_side_lidar_minimum_point_after_mask = None
+        self.lidar_self_mask_filtered_count = 0
+        self.lidar_self_mask_matched_regions: tuple[str, ...] = ()
+
         self.bridge = CvBridge()
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(
@@ -377,6 +435,9 @@ class ParkingNode(Node):
                 points, t.x, t.y, yaw
             )
 
+        # Do not mask detector input: the self-return is only excluded while
+        # finding a safety-sector minimum.
+        self._update_left_side_lidar_safety(points)
         estimate = self.detector.detect(points, now)
         self.fusion.update_lidar(estimate)
         self.last_lidar_at = now
@@ -450,6 +511,7 @@ class ParkingNode(Node):
             self.fsm.state,
             side,
         )
+        safety = self._apply_left_side_lidar_hard_stop(safety)
 
         lidar_fresh = (
             now - self.last_lidar_at <= self.lidar_timeout
@@ -491,7 +553,7 @@ class ParkingNode(Node):
         self.state_pub.publish(state)
 
         reason = String()
-        reason.data = command.reason
+        reason.data = self._reason_with_lidar_safety(command.reason)
         self.reason_pub.publish(reason)
 
         clearances = Float32MultiArray()
@@ -500,6 +562,63 @@ class ParkingNode(Node):
 
         if slot is not None:
             self._publish_target_pose(slot)
+
+    def _update_left_side_lidar_safety(self, points: np.ndarray) -> None:
+        result = self.lidar_self_mask.minimum_in_sector(
+            points, self.left_side_sector
+        )
+        self.left_side_lidar_minimum_before_mask = result.before_mask.distance
+        self.left_side_lidar_minimum_after_mask = result.after_mask.distance
+        self.left_side_lidar_minimum_point_after_mask = result.after_mask.point
+        self.lidar_self_mask_filtered_count = result.filtered_count
+        self.lidar_self_mask_matched_regions = result.matched_regions
+
+    def _apply_left_side_lidar_hard_stop(
+        self, ultrasonic_safety: SafetyDecision
+    ) -> SafetyDecision:
+        """LiDAR safety takes precedence; the FSM performs the safe stop."""
+        if (
+            math.isfinite(self.left_side_lidar_minimum_after_mask)
+            and self.left_side_lidar_minimum_after_mask
+            < self.left_side_hard_stop_distance
+        ):
+            return SafetyDecision(
+                hard_stop=True,
+                speed_scale=0.0,
+                steering_bias=0.0,
+                reason="LIDAR_HARD_STOP:left_side",
+                minimum_active_distance=(
+                    self.left_side_lidar_minimum_after_mask
+                ),
+            )
+        return ultrasonic_safety
+
+    def _reason_with_lidar_safety(self, primary_reason: str) -> str:
+        def format_distance(distance: float) -> str:
+            return "inf" if not math.isfinite(distance) else f"{distance:.3f}"
+
+        point = self.left_side_lidar_minimum_point_after_mask
+        point_text = (
+            "none"
+            if point is None
+            else f"({point[0]:.3f},{point[1]:.3f})"
+        )
+        diagnostics = [
+            "lidar_self_mask_enabled="
+            + str(self.lidar_self_mask.enabled).lower(),
+            "lidar_self_mask_filtered_count="
+            + str(self.lidar_self_mask_filtered_count),
+            "left_side_min_before_mask="
+            + format_distance(self.left_side_lidar_minimum_before_mask),
+            "left_side_min_after_mask="
+            + format_distance(self.left_side_lidar_minimum_after_mask),
+            "left_side_min_point_after_mask=" + point_text,
+        ]
+        diagnostics.extend(
+            f"LIDAR_SELF_RETURN_MASKED:{name}"
+            for name in self.lidar_self_mask_matched_regions
+        )
+        return " | ".join((primary_reason, *diagnostics))
 
     def _publish_target_pose(
         self,
