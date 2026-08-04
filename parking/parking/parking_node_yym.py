@@ -8,15 +8,14 @@ at an explicit 0-degree steering target and, when the first parked vehicle is
 confirmed, performs a calibrated left turn. LiDAR
 then confirms that both parked vehicles are visible and performs one-second
 midpoint-angle corrections while reversing. Once either parked vehicle enters
-the 1 m ring, the controller stops for five seconds. Its first final segment
-chooses either the red/green line error or the two vehicles' mean tilt for
-0.5 seconds, stops and independently repeats that decision for a second
-0.5-second segment, then reverses continuously only after stopping and
-centering the steering at zero.
+the 1 m ring, the controller stops for five seconds. It then independently
+measures and corrects either the red/green line error or the robust parked-
+vehicle longitudinal tilt for two 0.5-second segments. It stops between
+segments and, after the second, reverses continuously only after another stop
+and explicit steering-zero settling period.
 Parking completes when either original parked vehicle, not a later pillar or
-unit, disappears below the rear-mounted LiDAR's horizontal x=0 line.
-After a two-second parked hold, the controller executes the timed exit
-sequence and finishes stopped with centered steering.
+unit, disappears below the rear-mounted LiDAR's horizontal x=0 line. The
+controller then remains stopped with steering centered; exit is disabled.
 """
 
 from __future__ import annotations
@@ -134,10 +133,18 @@ class ParkingNodeYym(Node):
         # green horizontal x=0 line can represent the two parked vehicles.
         self.declare_parameter('pre_final_vehicle_max_x_m', 0.0)
 
-        self.declare_parameter('first_car_confirm_frames', 3)
+        self.declare_parameter('first_car_confirm_frames', 5)
+        self.declare_parameter('first_car_min_points', 12)
+        self.declare_parameter('first_car_min_extent_m', 0.30)
         # Recognition only: distant wall/noise clusters must not trigger the
         # timed left turn. Parking-mode clustering keeps its full 4 m range.
         self.declare_parameter('first_car_max_distance_m', 2.0)
+        # During the initial straight approach, ignore clusters whose center
+        # lies behind the LiDAR/green horizontal x=0 line.
+        self.declare_parameter('first_car_min_center_x_m', 0.25)
+        # Apply the same boundary to individual points before clustering so
+        # rear noise cannot merge with front returns and shift the center.
+        self.declare_parameter('recognition_vehicle_min_x_m', 0.15)
         self.declare_parameter('gap_confirm_frames', 3)
         self.declare_parameter('gap_min_width_m', 0.48)
         self.declare_parameter('gap_max_width_m', 1.40)
@@ -167,7 +174,14 @@ class ParkingNodeYym(Node):
         self.declare_parameter('reverse_steer_multiplier', 10.0)
         # Use gentler corrections after the 1 m trigger and five-second stop.
         self.declare_parameter('final_reverse_steer_multiplier', 5.0)
-        self.declare_parameter('final_line_alignment_tolerance_deg', 5.0)
+        self.declare_parameter('final_line_alignment_tolerance_deg', 3.0)
+        # A cardboard-box vehicle often appears as an L shape. Estimate its
+        # longitudinal tilt from the gap-facing edge and reject short cross
+        # faces that PCA can incorrectly report as an 80-90 degree tilt.
+        self.declare_parameter('final_edge_min_x_span_m', 0.20)
+        self.declare_parameter('final_edge_bin_count', 7)
+        self.declare_parameter('final_edge_min_bin_count', 3)
+        self.declare_parameter('final_edge_max_abs_angle_deg', 45.0)
         self.declare_parameter('final_correction_duration_sec', 0.5)
         self.declare_parameter('final_correction_segment_count', 2)
         self.declare_parameter('steer_settle_sec', 0.6)
@@ -271,9 +285,23 @@ class ParkingNodeYym(Node):
         self.first_car_confirm_frames = max(
             1, int(self._value('first_car_confirm_frames'))
         )
+        self.first_car_min_points = max(
+            self.cluster_min_points,
+            int(self._value('first_car_min_points')),
+        )
+        self.first_car_min_extent = max(
+            self.obstacle_min_extent,
+            float(self._value('first_car_min_extent_m')),
+        )
         self.first_car_max_distance = max(
             self.parking_min_range,
             float(self._value('first_car_max_distance_m')),
+        )
+        self.first_car_min_center_x = float(
+            self._value('first_car_min_center_x_m')
+        )
+        self.recognition_vehicle_min_x = float(
+            self._value('recognition_vehicle_min_x_m')
         )
         self.gap_confirm_frames = max(1, int(self._value('gap_confirm_frames')))
         self.gap_min_width = float(self._value('gap_min_width_m'))
@@ -332,6 +360,18 @@ class ParkingNodeYym(Node):
         self.final_line_alignment_tolerance = max(
             0.0,
             float(self._value('final_line_alignment_tolerance_deg')),
+        )
+        self.final_edge_min_x_span = max(
+            0.05, float(self._value('final_edge_min_x_span_m'))
+        )
+        self.final_edge_bin_count = max(
+            3, int(self._value('final_edge_bin_count'))
+        )
+        self.final_edge_min_bin_count = max(
+            2, int(self._value('final_edge_min_bin_count'))
+        )
+        self.final_edge_max_abs_angle = max(
+            1.0, float(self._value('final_edge_max_abs_angle_deg'))
         )
         self.final_correction_duration = max(
             0.1, float(self._value('final_correction_duration_sec'))
@@ -462,7 +502,12 @@ class ParkingNodeYym(Node):
         self.get_logger().info(
             f'parking_node_yym: startup stop {self.startup_delay:.1f}s '
             '-> straight approach -> first-car trigger -> '
-            f'first-car range<={self.first_car_max_distance:.2f}m -> '
+            f'first-car range<={self.first_car_max_distance:.2f}m and '
+            f'point/center-x>={self.recognition_vehicle_min_x:.2f}/'
+            f'{self.first_car_min_center_x:.2f}m, '
+            f'points>={self.first_car_min_points}, '
+            f'extent>={self.first_car_min_extent:.2f}m for '
+            f'{self.first_car_confirm_frames} frames -> '
             f'{self.left_turn_duration_sec:.2f}s max-left timed turn '
             f'-> pre-final vehicle x<={self.pre_final_vehicle_max_x:.2f}m '
             'rear-half filter '
@@ -476,12 +521,8 @@ class ParkingNodeYym(Node):
             f'{self.final_line_alignment_tolerance:.1f}deg) '
             '-> mandatory stop + steer=0 settle '
             '-> steer=0 continuous reverse '
-            '-> either original vehicle clears line -> PARKED '
-            f'-> wait {self.exit_wait_after_park:.1f}s '
-            f'-> forward {self.exit_forward_duration:.1f}s '
-            f'-> max-right {self.exit_right_turn_duration:.1f}s '
-            f'-> forward {self.exit_final_forward_duration:.1f}s '
-            '-> EXIT_COMPLETE; '
+            '-> either original vehicle clears line '
+            '-> PARKED_HOLD with steer/speed=0/0; '
             f'start_mode={self.start_mode.value}, '
             f'recognition_only={self.recognition_only}'
         )
@@ -545,8 +586,17 @@ class ParkingNodeYym(Node):
             close_right_vehicles = [
                 vehicle
                 for vehicle in observation.right_vehicles
-                if self.vehicle_nearest_distance(vehicle)
-                <= self.first_car_max_distance
+                if (
+                    float(vehicle.center[0])
+                    >= self.first_car_min_center_x
+                    and len(vehicle.points) >= self.first_car_min_points
+                    and max(
+                        vehicle.x_max - vehicle.x_min,
+                        vehicle.y_max - vehicle.y_min,
+                    ) >= self.first_car_min_extent
+                    and self.vehicle_nearest_distance(vehicle)
+                    <= self.first_car_max_distance
+                )
             ]
             self.first_car_frames = (
                 self.first_car_frames + 1
@@ -849,7 +899,11 @@ class ParkingNodeYym(Node):
             if points else np.empty((0, 2), dtype=np.float64)
         )
         vehicle_point_array = point_array
-        if (
+        if self.mode == ParkingMode.RECOGNITION:
+            vehicle_point_array = point_array[
+                point_array[:, 0] >= self.recognition_vehicle_min_x
+            ]
+        elif (
             self.mode == ParkingMode.PARKING
             and not self.straight_reverse_latched
         ):
@@ -873,9 +927,14 @@ class ParkingNodeYym(Node):
             if item.center[1] < -self.right_detection_margin
         ]
         pair = self.select_parking_pair(vehicles)
+        observation_points = (
+            vehicle_point_array
+            if self.mode == ParkingMode.RECOGNITION
+            else point_array
+        )
         return LidarObservation(
             scan_valid=scan_point_count >= self.scan_quality_min_points,
-            points=point_array,
+            points=observation_points,
             vehicles=vehicles,
             right_vehicles=right_vehicles,
             pair=pair,
@@ -1175,6 +1234,7 @@ class ParkingNodeYym(Node):
     def control_tick(self) -> None:
         now = time.monotonic()
         if self.state in (
+            ParkingState.PARKED,
             ParkingState.EXIT_COMPLETE,
             ParkingState.PARKING_FAILED,
             ParkingState.EMERGENCY_STOP,
@@ -1573,20 +1633,6 @@ class ParkingNodeYym(Node):
             self.publish_control(0, 0)
             return
 
-        if self.state == ParkingState.PARKED:
-            self.reverse_phase = 'PARKED_WAIT_EXIT'
-            self.publish_control(0, 0)
-            if elapsed >= self.exit_wait_after_park:
-                self.mode = ParkingMode.EXIT
-                self.transition(ParkingState.EXIT_FORWARD, now)
-                self.reverse_phase = 'EXIT_FORWARD'
-                self.publish_control(0, self.exit_speed)
-                self.get_logger().info(
-                    f'EXIT: starting {self.exit_forward_duration:.1f}s '
-                    'straight drive'
-                )
-            return
-
         if self.state == ParkingState.EXIT_FORWARD:
             self.reverse_phase = 'EXIT_FORWARD'
             if elapsed >= self.exit_forward_duration:
@@ -1678,15 +1724,72 @@ class ParkingNodeYym(Node):
             math.atan2(-reference_y, rear_distance)
         )
 
-    @staticmethod
-    def final_average_alignment_angle(pair: ParkingPair) -> float:
-        """Return the mean tilt of the two parked vehicles in degrees."""
-        return math.degrees(
-            0.5 * (
-                float(pair.lower.axis_angle)
-                + float(pair.upper.axis_angle)
-            )
+    def final_vehicle_gap_edge_angle(
+        self,
+        vehicle: VehicleCluster,
+        *,
+        is_lower: bool,
+    ) -> Optional[tuple[float, float]]:
+        """Fit one vehicle's gap-facing longitudinal edge.
+
+        ``is_lower`` is the right-side vehicle in the debug/LiDAR view, so
+        its upper y edge faces the gap. The left vehicle uses its lower edge.
+        Returns ``(angle_degrees, x_span)`` only for a sufficiently long,
+        longitudinal edge; short transverse box faces are intentionally
+        rejected.
+        """
+        points = vehicle.points
+        if len(points) < self.final_edge_min_bin_count * 2:
+            return None
+
+        x_low, x_high = np.quantile(points[:, 0], (0.05, 0.95))
+        x_span = float(x_high - x_low)
+        if x_span < self.final_edge_min_x_span:
+            return None
+
+        bin_edges = np.linspace(
+            float(x_low), float(x_high), self.final_edge_bin_count + 1
         )
+        edge_points: list[tuple[float, float]] = []
+        edge_quantile = 0.85 if is_lower else 0.15
+        for bin_low, bin_high in zip(bin_edges[:-1], bin_edges[1:]):
+            in_bin = points[
+                (points[:, 0] >= bin_low)
+                & (points[:, 0] <= bin_high)
+            ]
+            if len(in_bin) < 2:
+                continue
+            edge_points.append((
+                float(np.median(in_bin[:, 0])),
+                float(np.quantile(in_bin[:, 1], edge_quantile)),
+            ))
+
+        if len(edge_points) < self.final_edge_min_bin_count:
+            return None
+        edge_array = np.asarray(edge_points, dtype=np.float64)
+        fitted_slope = float(np.polyfit(
+            edge_array[:, 0], edge_array[:, 1], 1
+        )[0])
+        angle = math.degrees(math.atan(fitted_slope))
+        if abs(angle) > self.final_edge_max_abs_angle:
+            return None
+        return angle, x_span
+
+    def final_average_alignment_angle(self, pair: ParkingPair) -> float:
+        """Return a span-weighted mean of reliable longitudinal edges."""
+        estimates = [
+            self.final_vehicle_gap_edge_angle(pair.lower, is_lower=True),
+            self.final_vehicle_gap_edge_angle(pair.upper, is_lower=False),
+        ]
+        valid_estimates = [item for item in estimates if item is not None]
+        if not valid_estimates:
+            return 0.0
+        total_span = sum(item[1] for item in valid_estimates)
+        if total_span <= 0.0:
+            return 0.0
+        return sum(
+            angle * span for angle, span in valid_estimates
+        ) / total_span
 
     def final_initial_alignment_steering(
         self, pair: ParkingPair

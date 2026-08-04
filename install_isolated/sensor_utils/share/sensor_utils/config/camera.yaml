@@ -1,0 +1,20 @@
+camera_node:
+  ros__parameters:
+    width: 640
+    height: 360
+    fps: 30.0
+    pixel_format: "YUYV"
+    auto_fallback_devices: true
+    required_name_substring: "C920"
+    high:
+      device: "/dev/video4"
+      frame_id: "camera_high"
+      image_topic: "/camera/high/image_raw"
+      camera_info_topic: "/camera/high/camera_info"
+      camera_info: "~/.ros/camera_info/c920_high.yaml"
+    low:
+      device: "auto"
+      frame_id: "camera_low"
+      image_topic: "/camera/low/image_raw"
+      camera_info_topic: "/camera/low/camera_info"
+      camera_info: "~/.ros/camera_info/c920_low.yaml"

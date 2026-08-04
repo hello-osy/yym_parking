@@ -1,0 +1,9 @@
+[console_scripts]
+camera_calibration_node = sensor_utils.camera_calibration_node:main
+camera_pose_check_node = sensor_utils.camera_pose_check_node:main
+camera_viewer_node = sensor_utils.camera_viewer_node:main
+controller_viewer_node = sensor_utils.controller_viewer_node:main
+hsv_tuner_node = sensor_utils.hsv_tuner_node:main
+joy_to_motor_node = sensor_utils.joy_to_motor_node:main
+lidar_viewer_node = sensor_utils.lidar_viewer_node:main
+ultrasonic_viewer_node = sensor_utils.ultrasonic_viewer_node:main

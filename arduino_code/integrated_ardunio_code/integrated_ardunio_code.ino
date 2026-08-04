@@ -26,8 +26,8 @@ constexpr uint8_t MOTOR2_IN1 = 11;
 constexpr uint8_t MOTOR2_IN2 = 10;
 
 constexpr uint8_t SENSOR_COUNT = 6;
-constexpr uint8_t TRIG_PINS[SENSOR_COUNT] = {22, 26, 30, 34, 38, 44};
-constexpr uint8_t ECHO_PINS[SENSOR_COUNT] = {23, 27, 31, 35, 39, 45};
+constexpr uint8_t TRIG_PINS[SENSOR_COUNT] = {22, 30, 26, 34, 38, 44};
+constexpr uint8_t ECHO_PINS[SENSOR_COUNT] = {23, 31, 27, 35, 39, 45};
 constexpr uint8_t ROTATION_SENSOR_PIN = A1;
 constexpr uint8_t ROTATION_SAMPLE_COUNT = 8;
 
@@ -93,20 +93,20 @@ void stopAll() {
   setDrive(0);
 }
 
-void homeSteering() {
-  setDrive(0);
+// void homeSteering() {
+//   setDrive(0);
 
-  // 현재 위치와 관계없이 왼쪽 끝까지 이동한다.
-  setSteer(-MAX_STEER_PWM);
-  delay(LEFT_END_TIME_MS);
-  setSteer(0);
-  delay(STEER_SETTLE_TIME_MS);
+//   // 현재 위치와 관계없이 왼쪽 끝까지 이동한다.
+//   setSteer(-MAX_STEER_PWM);
+//   delay(LEFT_END_TIME_MS);
+//   setSteer(0);
+//   delay(STEER_SETTLE_TIME_MS);
 
-  // 왼쪽 끝에서 중앙까지 복귀한다.
-  setSteer(MAX_STEER_PWM);
-  delay(LEFT_TO_CENTER_TIME_MS);
-  stopAll();
-}
+//   // 왼쪽 끝에서 중앙까지 복귀한다.
+//   setSteer(MAX_STEER_PWM);
+//   delay(LEFT_TO_CENTER_TIME_MS);
+//   stopAll();
+// }
 
 void processCommand() {
   commandBuffer[commandLength] = '\0';
@@ -228,7 +228,7 @@ void setup() {
   }
 
   stopAll();
-  homeSteering();
+  // homeSteering();
   lastCommandAt = millis();
   lastSensorAt = millis();
 }

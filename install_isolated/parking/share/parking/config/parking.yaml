@@ -1,0 +1,79 @@
+parking_node:
+  ros__parameters:
+    base_frame: base_link
+    scan_topic: /scan
+    high_camera_topic: /camera/high/image_raw
+    low_camera_topic: /camera/low/image_raw
+    motor_topic: /motor_control
+
+    auto_start: false
+
+    # 카메라 화각이 충분하지 않을 수 있으므로 LiDAR를 주 센서로 사용.
+    require_camera_for_motion: false
+    camera.enable_experimental_slot_hint: false
+    camera.out_line_required_frames: 3
+
+    lidar.x_min: -2.5
+    lidar.x_max: 3.0
+    lidar.lateral_min: 0.25
+    lidar.lateral_max: 2.0
+    lidar.max_processing_range: 4.0
+    lidar.bin_size: 0.04
+    lidar.minimum_points_per_bin: 2
+    lidar.expected_slot_width: 0.95
+    lidar.minimum_slot_width: 0.65
+    lidar.maximum_slot_width: 1.25
+    lidar.boundary_band: 0.12
+    lidar.minimum_confidence: 0.35
+
+    # Safety-sector-only self-return suppression.  These coordinates are the
+    # measured narrow reflection cluster; slot detection remains unmasked.
+    lidar.left_side_x_min: -0.75
+    lidar.left_side_x_max: 0.60
+    lidar.left_side_y_min: 0.10
+    lidar.left_side_y_max: 1.25
+    lidar.left_side_hard_stop_distance: 0.20
+    lidar_safety.self_mask.enabled: true
+    lidar_safety.self_mask.region.name: lidar_front_left_self_return
+    lidar_safety.self_mask.region.x_min: 0.04
+    lidar_safety.self_mask.region.x_max: 0.13
+    lidar_safety.self_mask.region.y_min: 0.11
+    lidar_safety.self_mask.region.y_max: 0.18
+    lidar_safety.self_mask.region.reason: >-
+      persistent self return near x=0.085 y=0.145 from replay analysis
+
+    fusion.history_size: 8
+    fusion.required_count: 5
+    fusion.minimum_confidence: 0.45
+
+    ultrasonic.median_window: 5
+    ultrasonic.stale_timeout: 0.6
+    ultrasonic.slow_distance: 0.25
+    ultrasonic.hard_stop_distance: 0.12
+    ultrasonic.enable_alignment_steering_bias: false
+
+    # 모두 실차 보정 전 임시값
+    control.approach_speed: 22
+    control.reverse_arc_speed: -18
+    control.align_speed: -14
+    control.final_reverse_speed: -12
+    control.exit_speed: 20
+
+    # 좌/우 슬롯 진입 조향 부호는 실제 차량에서 반드시 검증
+    control.left_slot_steer: 45
+    control.right_slot_steer: -45
+
+    control.staging_pass_distance: 0.20
+    control.target_depth: 0.90
+    control.target_rear_stop_distance: 0.14
+    control.counter_trigger_deg: 35.0
+    control.align_yaw_tolerance_deg: 8.0
+    control.final_yaw_tolerance_deg: 5.0
+    control.final_lateral_tolerance: 0.08
+    control.hold_time: 4.0
+    control.exit_straight_time: 1.0
+    control.exit_turn_steer: 0
+    control.rate_hz: 10.0
+
+    timeouts.lidar: 0.5
+    timeouts.camera: 0.8

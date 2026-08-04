@@ -1,0 +1,1 @@
+ament_cmake_symlink_install_targets("TARGET_FILES" "/home/hailab/osy/260711/ai-autonomous-driving-competition-2026/build_isolated/sllidar_ros2/sllidar_node" "/home/hailab/osy/260711/ai-autonomous-driving-competition-2026/build_isolated/sllidar_ros2/sllidar_client" "TARGETS" "sllidar_node" "sllidar_client" "RUNTIME_DESTINATION" "lib/sllidar_ros2")

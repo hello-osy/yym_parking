@@ -1,0 +1,1 @@
+/home/hailab/osy/260711/ai-autonomous-driving-competition-2026/build_isolated/sllidar_ros2/ament_cmake_core/sllidar_ros2Config.cmake

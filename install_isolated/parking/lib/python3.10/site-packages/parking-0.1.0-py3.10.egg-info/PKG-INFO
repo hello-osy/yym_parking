@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: parking
+Version: 0.1.0
+Summary: LiDAR-primary ROS 2 reverse perpendicular parking
+Maintainer: team
+Maintainer-email: team@example.com
+License: Apache-2.0
+Requires-Dist: setuptools
+Requires-Dist: numpy
+Provides-Extra: test
+Requires-Dist: pytest; extra == "test"
+Dynamic: license
+Dynamic: maintainer
+Dynamic: maintainer-email
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: summary

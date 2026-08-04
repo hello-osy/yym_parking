@@ -1,0 +1,88 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"hasInstallRule" : true,
+					"jsonFile" : "directory-.-b2ceebda02f4c8b1e960.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.12"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3
+					]
+				}
+			],
+			"name" : "",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "sllidar_ros2",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "sllidar_client::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-sllidar_client-c15aed82ae20d70d4a80.json",
+					"name" : "sllidar_client",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "sllidar_node::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-sllidar_node-41314c39dd21d41c5382.json",
+					"name" : "sllidar_node",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "sllidar_ros2_uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-sllidar_ros2_uninstall-ac5d4cdf5a393c916542.json",
+					"name" : "sllidar_ros2_uninstall",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-uninstall-1c0d6e4efe63ae2e98d9.json",
+					"name" : "uninstall",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "/home/hailab/osy/260711/ai-autonomous-driving-competition-2026/build_isolated/sllidar_ros2",
+		"source" : "/home/hailab/osy/260711/ai-autonomous-driving-competition-2026/sllidar_ros2"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 3
+	}
+}

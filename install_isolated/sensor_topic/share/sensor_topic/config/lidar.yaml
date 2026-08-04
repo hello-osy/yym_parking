@@ -1,0 +1,10 @@
+lidar_node:
+  ros__parameters:
+    port: "/dev/ttyUSB0"
+    baudrate: 115200
+    frame_id: "laser"
+    topic_name: "/scan"
+    range_min: 0.15
+    range_max: 12.0
+    angle_increment_deg: 1.0
+    publish_rate: 10.0
