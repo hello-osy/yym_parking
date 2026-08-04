@@ -7,15 +7,14 @@ The controller holds still for a configurable startup delay, then approaches
 at an explicit 0-degree steering target and, when the first parked vehicle is
 confirmed, performs a calibrated left turn. LiDAR
 then confirms that both parked vehicles are visible and performs one-second
-midpoint-angle corrections while reversing. Once either parked vehicle enters
-the 1 m ring, the controller stops for five seconds. It then independently
-measures and corrects either the red/green line error or the robust parked-
-vehicle longitudinal tilt for two 0.5-second segments. It stops between
-segments and, after the second, reverses continuously only after another stop
-and explicit steering-zero settling period.
+midpoint-angle corrections with gentle parked-vehicle edge alignment while
+reversing. Once either parked vehicle enters the 1 m ring, the controller stops
+for five seconds. It then performs two LiDAR corrections of 0.5 seconds each,
+stops to center steering, and reverses straight until the unchanged LiDAR
+parking-completion condition is reached.
 Parking completes when either original parked vehicle, not a later pillar or
 unit, disappears below the rear-mounted LiDAR's horizontal x=0 line. The
-controller then remains stopped with steering centered; exit is disabled.
+controller waits while stopped, then runs the configured timed exit sequence.
 """
 
 from __future__ import annotations
@@ -31,8 +30,10 @@ from typing import Optional
 import cv2
 import numpy as np
 import rclpy
+from cv_bridge import CvBridge
 from rclpy.node import Node
-from sensor_msgs.msg import LaserScan
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image, LaserScan
 from std_msgs.msg import Int16MultiArray
 
 
@@ -95,6 +96,21 @@ class LidarObservation:
     pair_is_fallback: bool = False
 
 
+@dataclass
+class ParkingLineObservation:
+    """High-camera features used only during precision reverse."""
+
+    stamp: float
+    horizontal_line: tuple[float, float, float, float]
+    vertical_line: tuple[float, float, float, float]
+    intersection: tuple[float, float]
+    horizontal_y_ratio: float
+    horizontal_angle_deg: float
+    vertical_angle_deg: float
+    position_error_ratio: float
+    steering_deg: int
+
+
 class ParkingNodeYym(Node):
     """LiDAR-feedback parking into random right-side slot 2 or 3."""
 
@@ -133,18 +149,18 @@ class ParkingNodeYym(Node):
         # green horizontal x=0 line can represent the two parked vehicles.
         self.declare_parameter('pre_final_vehicle_max_x_m', 0.0)
 
-        self.declare_parameter('first_car_confirm_frames', 5)
-        self.declare_parameter('first_car_min_points', 12)
-        self.declare_parameter('first_car_min_extent_m', 0.30)
+        self.declare_parameter('first_car_confirm_frames', 2)
+        self.declare_parameter('first_car_min_points', 7)
+        self.declare_parameter('first_car_min_extent_m', 0.22)
         # Recognition only: distant wall/noise clusters must not trigger the
         # timed left turn. Parking-mode clustering keeps its full 4 m range.
         self.declare_parameter('first_car_max_distance_m', 2.0)
         # During the initial straight approach, ignore clusters whose center
         # lies behind the LiDAR/green horizontal x=0 line.
-        self.declare_parameter('first_car_min_center_x_m', 0.25)
+        self.declare_parameter('first_car_min_center_x_m', 0.10)
         # Apply the same boundary to individual points before clustering so
         # rear noise cannot merge with front returns and shift the center.
-        self.declare_parameter('recognition_vehicle_min_x_m', 0.15)
+        self.declare_parameter('recognition_vehicle_min_x_m', 0.05)
         self.declare_parameter('gap_confirm_frames', 3)
         self.declare_parameter('gap_min_width_m', 0.48)
         self.declare_parameter('gap_max_width_m', 1.40)
@@ -166,12 +182,17 @@ class ParkingNodeYym(Node):
         self.declare_parameter('lidar_side_far_stop_sec', 4.0)
         self.declare_parameter('exit_wait_after_park_sec', 2.0)
         self.declare_parameter('exit_forward_duration_sec', 3.0)
-        self.declare_parameter('exit_right_turn_duration_sec', 8.0)
+        self.declare_parameter('exit_right_turn_duration_sec', 10.0)
         self.declare_parameter('exit_final_forward_duration_sec', 10.0)
         self.declare_parameter('exit_right_steer_deg', 45)
         self.declare_parameter('exit_speed', 110)
         # Real-vehicle testing showed the raw geometric angle was too weak.
         self.declare_parameter('reverse_steer_multiplier', 10.0)
+        # Before the 1 m latch, preserve strong midpoint centering and add a
+        # gentler gap-facing longitudinal-edge alignment correction.
+        self.declare_parameter(
+            'pre_final_alignment_steer_multiplier', 5.0
+        )
         # Use gentler corrections after the 1 m trigger and five-second stop.
         self.declare_parameter('final_reverse_steer_multiplier', 5.0)
         self.declare_parameter('final_line_alignment_tolerance_deg', 3.0)
@@ -219,6 +240,58 @@ class ParkingNodeYym(Node):
         # With only one parked vehicle visible, its PCA line replaces the
         # unavailable two-vehicle midpoint. A vertical debug line is 0 deg.
         self.declare_parameter('single_vehicle_angle_deadband_deg', 2.0)
+
+        # Precision reverse starts only after the five-second stop. The slot
+        # number is deliberately selected by the operator because this course
+        # has exactly two valid target appearances. Reference coordinates are
+        # normalized raw high-camera image coordinates, not screenshot pixels.
+        try:
+            default_parking_slot = int(
+                os.environ.get('PARKING_SLOT_NUMBER', '2')
+            )
+        except ValueError:
+            default_parking_slot = 2
+        self.declare_parameter(
+            'parking_slot_number', default_parking_slot
+        )
+        self.declare_parameter(
+            'high_camera_topic', '/camera/high/image_raw'
+        )
+        self.declare_parameter('camera_line_timeout_sec', 0.5)
+        self.declare_parameter('camera_line_confirm_frames', 3)
+        self.declare_parameter('camera_line_loss_confirm_frames', 3)
+        self.declare_parameter('camera_line_white_threshold', 175)
+        self.declare_parameter('camera_line_max_saturation', 85)
+        self.declare_parameter('camera_horizontal_max_angle_deg', 18.0)
+        self.declare_parameter('camera_vertical_max_angle_deg', 50.0)
+        self.declare_parameter('camera_horizontal_min_length_ratio', 0.18)
+        self.declare_parameter('camera_vertical_min_length_ratio', 0.05)
+        self.declare_parameter('camera_feature_ema_alpha', 0.35)
+        # Reference features measured from the supplied perfectly parked
+        # views. Keep these parameters exposed for calibration from raw frames.
+        self.declare_parameter('slot2_horizontal_y_ratio', 0.052)
+        self.declare_parameter('slot2_horizontal_angle_deg', 0.0)
+        self.declare_parameter('slot2_vertical_x_ratio', 0.500)
+        self.declare_parameter('slot2_vertical_angle_deg', 0.0)
+        self.declare_parameter('slot3_horizontal_y_ratio', 0.055)
+        self.declare_parameter('slot3_horizontal_angle_deg', 0.0)
+        self.declare_parameter('slot3_corner_x_ratio', 0.693)
+        self.declare_parameter('slot3_vertical_angle_deg', -30.0)
+        self.declare_parameter('camera_position_gain_deg', 160.0)
+        self.declare_parameter(
+            'camera_vertical_reference_tolerance_deg', 25.0
+        )
+        self.declare_parameter(
+            'camera_horizontal_reference_tolerance_deg', 12.0
+        )
+        # Rear-view point error and steering are opposite during reverse:
+        # detected point left of target -> right steer, and vice versa.
+        self.declare_parameter('camera_steer_sign', -1.0)
+        self.declare_parameter('camera_max_steer_deg', 35)
+        self.declare_parameter('camera_steer_deadband_deg', 1.0)
+        self.declare_parameter(
+            'camera_debug_window_name', 'parking_yym_high_camera'
+        )
 
         self.declare_parameter('rear_hard_stop_angle_deg', 11.0)
         self.declare_parameter('rear_hard_stop_distance_m', 0.18)
@@ -354,6 +427,12 @@ class ParkingNodeYym(Node):
         self.reverse_steer_multiplier = max(
             0.0, float(self._value('reverse_steer_multiplier'))
         )
+        self.pre_final_alignment_steer_multiplier = max(
+            0.0,
+            float(self._value(
+                'pre_final_alignment_steer_multiplier'
+            )),
+        )
         self.final_reverse_steer_multiplier = max(
             0.0, float(self._value('final_reverse_steer_multiplier'))
         )
@@ -427,6 +506,96 @@ class ParkingNodeYym(Node):
             0.0, float(self._value('single_vehicle_angle_deadband_deg'))
         )
 
+        requested_slot = int(self._value('parking_slot_number'))
+        if requested_slot not in (2, 3):
+            self.get_logger().warning(
+                f'parking_slot_number={requested_slot} is invalid; using 2'
+            )
+            requested_slot = 2
+        self.parking_slot_number = requested_slot
+        self.high_camera_topic = str(self._value('high_camera_topic'))
+        self.camera_line_timeout = max(
+            0.05, float(self._value('camera_line_timeout_sec'))
+        )
+        self.camera_line_confirm_frames = max(
+            1, int(self._value('camera_line_confirm_frames'))
+        )
+        self.camera_line_loss_confirm_frames = max(
+            1, int(self._value('camera_line_loss_confirm_frames'))
+        )
+        self.camera_line_white_threshold = int(np.clip(
+            int(self._value('camera_line_white_threshold')), 0, 255
+        ))
+        self.camera_line_max_saturation = int(np.clip(
+            int(self._value('camera_line_max_saturation')), 0, 255
+        ))
+        self.camera_horizontal_max_angle = max(
+            1.0, float(self._value('camera_horizontal_max_angle_deg'))
+        )
+        self.camera_vertical_max_angle = max(
+            10.0, float(self._value('camera_vertical_max_angle_deg'))
+        )
+        self.camera_horizontal_min_length = max(
+            0.05,
+            float(self._value('camera_horizontal_min_length_ratio')),
+        )
+        self.camera_vertical_min_length = max(
+            0.03,
+            float(self._value('camera_vertical_min_length_ratio')),
+        )
+        self.camera_feature_ema_alpha = float(np.clip(
+            float(self._value('camera_feature_ema_alpha')), 0.05, 1.0
+        ))
+        self.slot2_horizontal_y = float(
+            self._value('slot2_horizontal_y_ratio')
+        )
+        self.slot2_horizontal_angle = float(
+            self._value('slot2_horizontal_angle_deg')
+        )
+        self.slot2_vertical_x = float(
+            self._value('slot2_vertical_x_ratio')
+        )
+        self.slot2_vertical_angle = float(
+            self._value('slot2_vertical_angle_deg')
+        )
+        self.slot3_horizontal_y = float(
+            self._value('slot3_horizontal_y_ratio')
+        )
+        self.slot3_horizontal_angle = float(
+            self._value('slot3_horizontal_angle_deg')
+        )
+        self.slot3_corner_x = float(
+            self._value('slot3_corner_x_ratio')
+        )
+        self.slot3_vertical_angle = float(
+            self._value('slot3_vertical_angle_deg')
+        )
+        self.camera_position_gain = float(
+            self._value('camera_position_gain_deg')
+        )
+        self.camera_vertical_reference_tolerance = max(
+            1.0,
+            float(self._value(
+                'camera_vertical_reference_tolerance_deg'
+            )),
+        )
+        self.camera_horizontal_reference_tolerance = max(
+            1.0,
+            float(self._value(
+                'camera_horizontal_reference_tolerance_deg'
+            )),
+        )
+        self.camera_steer_sign = float(self._value('camera_steer_sign'))
+        self.camera_max_steer = int(np.clip(
+            int(self._value('camera_max_steer_deg')), 1, 45
+        ))
+        self.camera_steer_deadband = max(
+            0.0, float(self._value('camera_steer_deadband_deg'))
+        )
+        self.camera_debug_window_name = str(
+            self._value('camera_debug_window_name')
+        )
+
         self.rear_hard_stop_angle = math.radians(
             float(self._value('rear_hard_stop_angle_deg'))
         )
@@ -488,6 +657,13 @@ class ParkingNodeYym(Node):
         self.gap_frames = 0
         self.latest_scan: Optional[LaserScan] = None
         self.observation = self._empty_observation()
+        self.cv_bridge = CvBridge()
+        self.camera_line_observation: Optional[ParkingLineObservation] = None
+        self.camera_line_confirm_count = 0
+        self.camera_line_miss_count = 0
+        self.camera_filtered_position_error: Optional[float] = None
+        self.camera_debug_image: Optional[np.ndarray] = None
+        self.precision_reverse_guidance_source = 'MONITOR_ONLY'
 
         self.motor_publisher = self.create_publisher(
             Int16MultiArray, self.motor_topic, 10
@@ -516,13 +692,12 @@ class ParkingNodeYym(Node):
             f'-> {self.straight_reverse_radius:.2f}m ring stop for '
             f'{self.straight_reverse_stop:.1f}s '
             f'-> {self.final_correction_segment_count} x '
-            f'{self.final_correction_duration:.1f}s '
-            f'conditional corrections (line tolerance +/-'
-            f'{self.final_line_alignment_tolerance:.1f}deg) '
+            f'{self.final_correction_duration:.1f}s LiDAR corrections '
             '-> mandatory stop + steer=0 settle '
             '-> steer=0 continuous reverse '
             '-> either original vehicle clears line '
-            '-> PARKED_HOLD with steer/speed=0/0; '
+            f'-> PARKED stop {self.exit_wait_after_park:.1f}s '
+            '-> timed exit sequence -> EXIT_COMPLETE; '
             f'start_mode={self.start_mode.value}, '
             f'recognition_only={self.recognition_only}'
         )
@@ -611,6 +786,425 @@ class ParkingNodeYym(Node):
             )
         else:
             self.gap_frames = 0
+
+    def high_camera_callback(self, msg: Image) -> None:
+        """Extract the slot-specific white-line pose from the high camera."""
+        now = time.monotonic()
+        try:
+            image = self.cv_bridge.imgmsg_to_cv2(
+                msg, desired_encoding='bgr8'
+            )
+            observation, debug_image = self.detect_parking_lines(image, now)
+            self.camera_debug_image = debug_image
+            if observation is None:
+                self.camera_line_miss_count += 1
+                if (
+                    self.camera_line_miss_count
+                    >= self.camera_line_loss_confirm_frames
+                ):
+                    self.camera_line_confirm_count = 0
+                    self.camera_line_observation = None
+                    self.camera_filtered_position_error = None
+                return
+            self.camera_line_miss_count = 0
+            self.camera_line_confirm_count = min(
+                self.camera_line_confirm_frames,
+                self.camera_line_confirm_count + 1,
+            )
+            self.camera_line_observation = observation
+        except Exception as error:
+            self.camera_line_miss_count += 1
+            self.camera_line_confirm_count = 0
+            self.camera_line_observation = None
+            self.get_logger().warning(
+                f'High camera line processing failed: {error}',
+                throttle_duration_sec=2.0,
+            )
+
+    @staticmethod
+    def normalized_line_angle(
+        line: tuple[float, float, float, float]
+    ) -> float:
+        """Return a direction-independent image-line angle in [-90, 90)."""
+        x1, y1, x2, y2 = line
+        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+        while angle >= 90.0:
+            angle -= 180.0
+        while angle < -90.0:
+            angle += 180.0
+        return angle
+
+    @staticmethod
+    def vertical_line_angle(
+        line: tuple[float, float, float, float]
+    ) -> float:
+        """Return image tilt from vertical, consistently measured top-bottom."""
+        x1, y1, x2, y2 = line
+        if y1 > y2:
+            x1, y1, x2, y2 = x2, y2, x1, y1
+        return math.degrees(math.atan2(x2 - x1, max(1.0, y2 - y1)))
+
+    @staticmethod
+    def line_x_at_y(
+        line: tuple[float, float, float, float], y: float
+    ) -> Optional[float]:
+        x1, y1, x2, y2 = line
+        dy = y2 - y1
+        if abs(dy) < 1.0e-6:
+            return None
+        return x1 + (y - y1) * (x2 - x1) / dy
+
+    @staticmethod
+    def line_y_at_x(
+        line: tuple[float, float, float, float], x: float
+    ) -> Optional[float]:
+        x1, y1, x2, y2 = line
+        dx = x2 - x1
+        if abs(dx) < 1.0e-6:
+            return None
+        return y1 + (x - x1) * (y2 - y1) / dx
+
+    @staticmethod
+    def line_intersection(
+        first: tuple[float, float, float, float],
+        second: tuple[float, float, float, float],
+    ) -> Optional[tuple[float, float]]:
+        x1, y1, x2, y2 = first
+        x3, y3, x4, y4 = second
+        denominator = (
+            (x1 - x2) * (y3 - y4)
+            - (y1 - y2) * (x3 - x4)
+        )
+        if abs(denominator) < 1.0e-6:
+            return None
+        first_cross = x1 * y2 - y1 * x2
+        second_cross = x3 * y4 - y3 * x4
+        x = (
+            first_cross * (x3 - x4)
+            - (x1 - x2) * second_cross
+        ) / denominator
+        y = (
+            first_cross * (y3 - y4)
+            - (y1 - y2) * second_cross
+        ) / denominator
+        return float(x), float(y)
+
+    def detect_parking_lines(
+        self, image: np.ndarray, now: float
+    ) -> tuple[Optional[ParkingLineObservation], np.ndarray]:
+        """Detect the horizontal boundary and slot-specific longitudinal line."""
+        debug = image.copy()
+        if image.size == 0:
+            return None, debug
+        height, width = image.shape[:2]
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        white_mask = cv2.inRange(
+            hsv,
+            np.array([0, 0, self.camera_line_white_threshold], dtype=np.uint8),
+            np.array(
+                [180, self.camera_line_max_saturation, 255], dtype=np.uint8
+            ),
+        )
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        white_mask = cv2.morphologyEx(
+            white_mask, cv2.MORPH_CLOSE, kernel, iterations=2
+        )
+        edges = cv2.Canny(white_mask, 40, 120)
+        lines = cv2.HoughLinesP(
+            edges,
+            1,
+            np.pi / 180.0,
+            25,
+            minLineLength=max(12, int(height * 0.06)),
+            maxLineGap=max(10, int(height * 0.08)),
+        )
+        if lines is None:
+            self._draw_camera_reference(debug)
+            return None, debug
+
+        horizontal_target_y = (
+            self.slot2_horizontal_y
+            if self.parking_slot_number == 2
+            else self.slot3_horizontal_y
+        )
+        horizontal_candidates: list[
+            tuple[float, tuple[float, float, float, float]]
+        ] = []
+        vertical_candidates: list[
+            tuple[float, tuple[float, float, float, float]]
+        ] = []
+        for raw_line in lines[:, 0]:
+            x1, y1, x2, y2 = (float(value) for value in raw_line)
+            line = (x1, y1, x2, y2)
+            length = math.hypot(x2 - x1, y2 - y1)
+            horizontal_angle = self.normalized_line_angle(line)
+            if (
+                abs(horizontal_angle) <= self.camera_horizontal_max_angle
+                and length >= width * self.camera_horizontal_min_length
+                and min(y1, y2) <= height * 0.70
+            ):
+                middle_y = 0.5 * (y1 + y2)
+                target_distance = abs(
+                    middle_y / max(1, height) - horizontal_target_y
+                )
+                score = length / (1.0 + 1.5 * target_distance)
+                horizontal_candidates.append((score, line))
+
+            vertical_angle = self.vertical_line_angle(line)
+            if (
+                abs(vertical_angle) <= self.camera_vertical_max_angle
+                and length >= height * self.camera_vertical_min_length
+            ):
+                middle_x = 0.5 * (x1 + x2) / max(1, width)
+                if self.parking_slot_number == 2:
+                    if not 0.20 <= middle_x <= 0.80:
+                        continue
+                    position_distance = abs(
+                        middle_x - self.slot2_vertical_x
+                    )
+                    angle_distance = abs(
+                        vertical_angle - self.slot2_vertical_angle
+                    ) / 90.0
+                else:
+                    if not 0.45 <= middle_x <= 0.98:
+                        continue
+                    position_distance = abs(
+                        middle_x - self.slot3_corner_x
+                    )
+                    angle_distance = abs(
+                        vertical_angle - self.slot3_vertical_angle
+                    ) / 90.0
+                score = length / (
+                    1.0 + 2.0 * position_distance + angle_distance
+                )
+                vertical_candidates.append((score, line))
+
+        if not horizontal_candidates or not vertical_candidates:
+            self._draw_camera_reference(debug)
+            return None, debug
+
+        # Pick a connected-looking T/corner pair instead of selecting the two
+        # line types independently. The requested parking boundary is always
+        # below the visible longitudinal line: in image coordinates its
+        # intersection must be at, or just below, the vertical segment's
+        # lower endpoint. This rejects the other white horizontal course line.
+        best_pair: Optional[tuple[
+            float,
+            tuple[float, float, float, float],
+            tuple[float, float, float, float],
+            tuple[float, float],
+        ]] = None
+        lower_endpoint_tolerance = max(8.0, height * 0.04)
+        maximum_endpoint_gap = max(18.0, height * 0.15)
+        for horizontal_score, candidate_horizontal in horizontal_candidates:
+            for vertical_score, candidate_vertical in vertical_candidates:
+                candidate_intersection = self.line_intersection(
+                    candidate_horizontal, candidate_vertical
+                )
+                if candidate_intersection is None:
+                    continue
+                candidate_x, candidate_y = candidate_intersection
+                if not (
+                    -0.10 * width <= candidate_x <= 1.10 * width
+                    and -0.10 * height <= candidate_y <= 0.80 * height
+                ):
+                    continue
+                vertical_y1 = candidate_vertical[1]
+                vertical_y2 = candidate_vertical[3]
+                vertical_middle_y = 0.5 * (vertical_y1 + vertical_y2)
+                vertical_bottom_y = max(vertical_y1, vertical_y2)
+                if candidate_y < vertical_middle_y:
+                    continue
+                if candidate_y < vertical_bottom_y - lower_endpoint_tolerance:
+                    continue
+                endpoint_gap = candidate_y - vertical_bottom_y
+                if endpoint_gap > maximum_endpoint_gap:
+                    continue
+                target_distance = abs(
+                    candidate_y / max(1, height) - horizontal_target_y
+                )
+                pair_score = (
+                    horizontal_score + vertical_score
+                ) / (
+                    1.0
+                    + 3.0 * target_distance
+                    + 4.0 * abs(endpoint_gap) / max(1, height)
+                )
+                if best_pair is None or pair_score > best_pair[0]:
+                    best_pair = (
+                        pair_score,
+                        candidate_horizontal,
+                        candidate_vertical,
+                        candidate_intersection,
+                    )
+
+        if best_pair is None:
+            self._draw_camera_reference(debug)
+            return None, debug
+        _, horizontal_line, vertical_line, intersection = best_pair
+        corner_x, corner_y = intersection
+
+        horizontal_angle = self.normalized_line_angle(horizontal_line)
+        vertical_angle = self.vertical_line_angle(vertical_line)
+        if self.parking_slot_number == 2:
+            position_error = corner_x / width - self.slot2_vertical_x
+            target_vertical_angle = self.slot2_vertical_angle
+            target_horizontal_angle = self.slot2_horizontal_angle
+            horizontal_y = corner_y
+        else:
+            position_error = corner_x / width - self.slot3_corner_x
+            target_vertical_angle = self.slot3_vertical_angle
+            target_horizontal_angle = self.slot3_horizontal_angle
+            horizontal_y = corner_y
+        if horizontal_y is None:
+            self._draw_camera_reference(debug)
+            return None, debug
+
+        vertical_angle_error = vertical_angle - target_vertical_angle
+        horizontal_angle_error = horizontal_angle - target_horizontal_angle
+        # The line angles validate that this is the intended parking corner;
+        # they no longer contribute to steering. One intersection point cannot
+        # independently control yaw, so angle errors are used only to reject a
+        # false crossing before the x-coordinate visual servo is activated.
+        if (
+            abs(vertical_angle_error)
+            > self.camera_vertical_reference_tolerance
+            or abs(horizontal_angle_error)
+            > self.camera_horizontal_reference_tolerance
+        ):
+            self._draw_camera_reference(debug)
+            return None, debug
+        alpha = self.camera_feature_ema_alpha
+        if self.camera_filtered_position_error is None:
+            filtered_position = position_error
+        else:
+            filtered_position = (
+                alpha * position_error
+                + (1.0 - alpha) * self.camera_filtered_position_error
+            )
+        self.camera_filtered_position_error = filtered_position
+
+        raw_steering = (
+            self.camera_steer_sign
+            * self.camera_position_gain
+            * filtered_position
+        )
+        if abs(raw_steering) < self.camera_steer_deadband:
+            raw_steering = 0.0
+        steering = int(round(np.clip(
+            raw_steering,
+            -self.camera_max_steer,
+            self.camera_max_steer,
+        )))
+        observation = ParkingLineObservation(
+            stamp=now,
+            horizontal_line=horizontal_line,
+            vertical_line=vertical_line,
+            intersection=(corner_x, corner_y),
+            horizontal_y_ratio=float(horizontal_y / height),
+            horizontal_angle_deg=horizontal_angle,
+            vertical_angle_deg=vertical_angle,
+            position_error_ratio=float(filtered_position),
+            steering_deg=steering,
+        )
+        self._draw_camera_reference(debug)
+        self._draw_detected_camera_lines(debug, observation)
+        return observation, debug
+
+    def _draw_camera_reference(self, image: np.ndarray) -> None:
+        height, width = image.shape[:2]
+        if self.parking_slot_number == 2:
+            target_x = int(round(self.slot2_vertical_x * width))
+            target_y = int(round(self.slot2_horizontal_y * height))
+        else:
+            target_x = int(round(self.slot3_corner_x * width))
+            target_y = int(round(self.slot3_horizontal_y * height))
+        cv2.circle(image, (target_x, target_y), 13, (0, 0, 255), 3)
+        cv2.drawMarker(
+            image,
+            (target_x, target_y),
+            (0, 0, 255),
+            cv2.MARKER_CROSS,
+            28,
+            3,
+        )
+        cv2.putText(
+            image,
+            'TARGET',
+            (target_x + 16, target_y + 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    def _draw_detected_camera_lines(
+        self, image: np.ndarray, observation: ParkingLineObservation
+    ) -> None:
+        height, width = image.shape[:2]
+        target = (
+            int(round(
+                (
+                    self.slot2_vertical_x
+                    if self.parking_slot_number == 2
+                    else self.slot3_corner_x
+                ) * width
+            )),
+            int(round(
+                (
+                    self.slot2_horizontal_y
+                    if self.parking_slot_number == 2
+                    else self.slot3_horizontal_y
+                ) * height
+            )),
+        )
+        detected = (
+            int(round(observation.intersection[0])),
+            int(round(observation.intersection[1])),
+        )
+        cv2.line(image, target, detected, (0, 255, 255), 2)
+        cv2.circle(image, detected, 11, (0, 255, 0), -1)
+        cv2.circle(image, detected, 14, (0, 0, 0), 2)
+        cv2.putText(
+            image,
+            'NOW',
+            (detected[0] + 15, detected[1] - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            image,
+            f'slot={self.parking_slot_number} point steer='
+            f'{observation.steering_deg:+d} xerr='
+            f'{observation.position_error_ratio:+.3f} '
+            f'xy=({observation.intersection[0] / width:.3f},'
+            f'{observation.intersection[1] / height:.3f})',
+            (10, image.shape[0] - 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (0, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    def active_camera_line_observation(
+        self, now: Optional[float] = None
+    ) -> Optional[ParkingLineObservation]:
+        """Return only a confirmed and fresh paired-line observation."""
+        if now is None:
+            now = time.monotonic()
+        observation = self.camera_line_observation
+        if (
+            observation is None
+            or self.camera_line_confirm_count < self.camera_line_confirm_frames
+            or now - observation.stamp > self.camera_line_timeout
+        ):
+            return None
+        return observation
 
     def lidar_side_vehicle_distances(
         self, vehicles: list[VehicleCluster]
@@ -858,7 +1452,7 @@ class ParkingNodeYym(Node):
                 'Final correction latched: a parked-vehicle point entered '
                 f'the {self.straight_reverse_radius:.2f}m ring; stopping for '
                 f'{self.straight_reverse_stop:.1f}s with steer=0 before '
-                'final two-vehicle corrections.'
+                'the final two LiDAR corrections.'
             )
 
     def observe(self, msg: LaserScan) -> LidarObservation:
@@ -1212,7 +1806,7 @@ class ParkingNodeYym(Node):
             self.reverse_segment_index = 1
             self.reverse_segment_drive_duration = self.reverse_segment_duration
             self.reverse_segment_steer = (
-                self.reverse_steering(pair)
+                self.pre_final_reverse_steering(pair)
                 if pair is not None
                 else 0
             )
@@ -1234,7 +1828,6 @@ class ParkingNodeYym(Node):
     def control_tick(self) -> None:
         now = time.monotonic()
         if self.state in (
-            ParkingState.PARKED,
             ParkingState.EXIT_COMPLETE,
             ParkingState.PARKING_FAILED,
             ParkingState.EMERGENCY_STOP,
@@ -1394,6 +1987,7 @@ class ParkingNodeYym(Node):
                 else now - self.reverse_phase_started_at
             )
             if self.reverse_phase == 'FINAL_STOP':
+                self.precision_reverse_guidance_source = 'WAITING_5S'
                 self.publish_control(0, 0)
                 if phase_elapsed >= self.straight_reverse_stop:
                     self.reverse_phase = 'FINAL_MEASURE_STOP'
@@ -1409,9 +2003,9 @@ class ParkingNodeYym(Node):
                     self.get_logger().info(
                         'Five-second stop complete: starting '
                         f'{self.final_correction_segment_count} x '
-                        f'{self.final_correction_duration:.1f}s corrections '
-                        'using line angle when misaligned or average parked-'
-                        'vehicle tilt when aligned'
+                        f'{self.final_correction_duration:.1f}s LiDAR '
+                        'corrections using line angle when misaligned or '
+                        'average parked-vehicle tilt when aligned'
                     )
                 return
 
@@ -1429,6 +2023,7 @@ class ParkingNodeYym(Node):
                 ):
                     self.transition(ParkingState.PARKED, now)
                     self.reverse_phase = 'PARKED_HOLD'
+                    self.precision_reverse_guidance_source = 'PARKED'
                     self.publish_control(0, 0)
                     self.get_logger().info(
                         'PARKED: an original parked vehicle cleared the green '
@@ -1491,6 +2086,7 @@ class ParkingNodeYym(Node):
                         f'{math.degrees(pair.upper.axis_angle):+.0f}deg'
                     )
                 else:
+                    self.precision_reverse_guidance_source = 'WAITING_SENSOR'
                     self.reverse_phase = 'FINAL_MEASURE_STOP'
                     self.reverse_phase_started_at = now
                     self.publish_control(self.held_steering_command(), 0)
@@ -1523,9 +2119,9 @@ class ParkingNodeYym(Node):
                             self.reverse_phase_started_at = now
                             self.publish_control(0, 0)
                             self.get_logger().info(
-                                f'{self.final_correction_segment_count} tilt '
-                                'corrections complete: mandatory stop and '
-                                'steer=0 centering before straight reverse'
+                                f'{self.final_correction_segment_count} '
+                                'LiDAR corrections complete: mandatory stop '
+                                'and steer=0 centering before straight reverse'
                             )
                             return
                         self.reverse_phase = 'FINAL_MEASURE_STOP'
@@ -1612,10 +2208,13 @@ class ParkingNodeYym(Node):
                     return
 
                 self.reverse_segment_index += 1
-                self.reverse_segment_steer = self.reverse_steering(pair)
+                self.reverse_segment_steer = (
+                    self.pre_final_reverse_steering(pair)
+                )
                 target_description = (
                     f'reference=({pair.reference_point[0]:+.2f},'
-                    f'{pair.reference_point[1]:+.2f})m'
+                    f'{pair.reference_point[1]:+.2f})m, edge-tilt='
+                    f'{self.final_average_alignment_angle(pair):+.1f}deg'
                 )
                 self.reverse_phase = 'STEER_SETTLE'
                 self.reverse_phase_started_at = now
@@ -1631,6 +2230,21 @@ class ParkingNodeYym(Node):
             self.reverse_phase_started_at = now
             self.lidar_side_far_frames = 0
             self.publish_control(0, 0)
+            return
+
+        if self.state == ParkingState.PARKED:
+            self.reverse_phase = 'PARKED_HOLD_BEFORE_EXIT'
+            self.publish_control(0, 0)
+            if elapsed >= self.exit_wait_after_park:
+                self.mode = ParkingMode.EXIT
+                self.transition(ParkingState.EXIT_FORWARD, now)
+                self.reverse_phase = 'EXIT_FORWARD'
+                self.publish_control(0, self.exit_speed)
+                self.get_logger().info(
+                    f'EXIT: parked hold complete after '
+                    f'{self.exit_wait_after_park:.1f}s; starting '
+                    f'{self.exit_forward_duration:.1f}s straight drive'
+                )
             return
 
         if self.state == ParkingState.EXIT_FORWARD:
@@ -1711,6 +2325,21 @@ class ParkingNodeYym(Node):
         return self.scaled_reverse_steering(
             self.reverse_reference_angle(pair)
         )
+
+    def pre_final_reverse_steering(self, pair: ParkingPair) -> int:
+        """Combine strong midpoint centering with gentle edge alignment."""
+        center_command = (
+            self.reverse_reference_angle(pair)
+            * self.reverse_steer_multiplier
+        )
+        alignment_command = (
+            self.final_average_alignment_angle(pair)
+            * self.pre_final_alignment_steer_multiplier
+        )
+        return int(round(max(
+            -45.0,
+            min(45.0, center_command + alignment_command),
+        )))
 
     @staticmethod
     def reverse_reference_angle(pair: ParkingPair) -> float:
@@ -2034,10 +2663,10 @@ class ParkingNodeYym(Node):
                         'FINAL_ZERO_STEER_SETTLE',
                         'FINAL_STRAIGHT_DRIVE',
                     )
-                    else self.final_conditional_steering(pair)
+                    else self.reverse_segment_steer
                 )
                 if self.reverse_phase.startswith('FINAL_')
-                else self.reverse_steering(pair)
+                else self.pre_final_reverse_steering(pair)
             )
             pair_text = (
                 f'pair='
@@ -2100,7 +2729,6 @@ class ParkingNodeYym(Node):
                 'FINAL_MEASURE_STOP',
                 'FINAL_ZERO_STEER_SETTLE',
                 'FINAL_STRAIGHT_DRIVE',
-                'PARKED_HOLD',
             ):
                 if self.reverse_phase == 'FINAL_ZERO_STEER_SETTLE':
                     guidance_text = (
@@ -2115,7 +2743,7 @@ class ParkingNodeYym(Node):
                     )
                 else:
                     guidance_text = (
-                        f'{self.final_correction_duration:.1f}s tilt '
+                        f'{self.final_correction_duration:.1f}s LiDAR '
                         f'correction {self.final_correction_count}/'
                         f'{self.final_correction_segment_count} | '
                         f'original gone L/R='
@@ -2141,6 +2769,55 @@ class ParkingNodeYym(Node):
             (0, 220, 220), 1, cv2.LINE_AA,
         )
         cv2.imshow(self.debug_window_name, image)
+        if self.camera_debug_image is not None:
+            camera_display = self.camera_debug_image.copy()
+            camera_active = (
+                self.precision_reverse_guidance_source == 'CAMERA'
+            )
+            banner = (
+                'CAMERA STEERING ACTIVE'
+                if camera_active
+                else 'CAMERA MONITOR ONLY | control='
+                f'{self.precision_reverse_guidance_source}'
+            )
+            banner_color = (
+                (0, 255, 0) if camera_active else (0, 180, 255)
+            )
+            border_thickness = 8 if camera_active else 3
+            cv2.rectangle(
+                camera_display,
+                (1, 1),
+                (
+                    camera_display.shape[1] - 2,
+                    camera_display.shape[0] - 2,
+                ),
+                banner_color,
+                border_thickness,
+            )
+            cv2.putText(
+                camera_display,
+                banner,
+                (12, 48),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.82,
+                (0, 0, 0),
+                5,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                camera_display,
+                banner,
+                (12, 48),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.82,
+                banner_color,
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.imshow(
+                self.camera_debug_window_name,
+                camera_display,
+            )
         cv2.waitKey(1)
 
     def destroy_node(self):
@@ -2148,6 +2825,8 @@ class ParkingNodeYym(Node):
             self.publish_control(0, 0)
             if self.debug_view:
                 cv2.destroyWindow(self.debug_window_name)
+                if self.camera_debug_image is not None:
+                    cv2.destroyWindow(self.camera_debug_window_name)
         except Exception:
             pass
         return super().destroy_node()
