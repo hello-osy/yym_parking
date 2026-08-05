@@ -141,6 +141,9 @@ class ParkingNodeYym(Node):
         self.declare_parameter('valid_sector_max_abs_deg', 125.0)
         self.declare_parameter('parking_min_range_m', 0.15)
         self.declare_parameter('cluster_max_range_m', 4.0)
+        # Allow slightly farther parked vehicles only while acquiring the
+        # initial two-vehicle gap before the first reverse segment.
+        self.declare_parameter('initial_gap_cluster_max_range_m', 6.0)
         self.declare_parameter('cluster_neighbor_distance_m', 0.20)
         self.declare_parameter('cluster_min_points', 7)
         self.declare_parameter('obstacle_min_extent_m', 0.22)
@@ -340,6 +343,10 @@ class ParkingNodeYym(Node):
         self.cluster_max_range = max(
             self.parking_min_range,
             float(self._value('cluster_max_range_m')),
+        )
+        self.initial_gap_cluster_max_range = max(
+            self.cluster_max_range,
+            float(self._value('initial_gap_cluster_max_range_m')),
         )
         self.cluster_neighbor_distance = max(
             0.02, float(self._value('cluster_neighbor_distance_m'))
@@ -1459,6 +1466,11 @@ class ParkingNodeYym(Node):
         points: list[tuple[float, float]] = []
         rear_distances: list[float] = []
         scan_point_count = 0
+        vehicle_cluster_max_range = (
+            self.initial_gap_cluster_max_range
+            if self.state == ParkingState.SETTLE_AND_ACQUIRE_GAP
+            else self.cluster_max_range
+        )
 
         for index, raw_distance in enumerate(msg.ranges):
             distance = float(raw_distance)
@@ -1479,7 +1491,7 @@ class ParkingNodeYym(Node):
                 rear_distances.append(distance)
             if (
                 abs(angle) > self.valid_sector_max_abs
-                or distance > self.cluster_max_range
+                or distance > vehicle_cluster_max_range
             ):
                 continue
 
