@@ -4,14 +4,15 @@ Scan convention used by this vehicle:
     rear=0 deg, right=+90 deg, front=+/-180 deg, left=-90 deg.
 
 The controller holds still for a configurable startup delay, then approaches
-at an explicit 0-degree steering target and, when the first parked vehicle is
-confirmed, performs a calibrated left turn. LiDAR
+without changing the operator-set wheel angle and, when the first parked
+vehicle is confirmed, performs a calibrated left turn. LiDAR
 then confirms that both parked vehicles are visible and performs one-second
 midpoint-angle corrections with gentle parked-vehicle edge alignment while
 reversing. Once either parked vehicle enters the 1 m ring, the controller stops
-for five seconds. It then performs two LiDAR corrections of 0.5 seconds each,
-stops to center steering, and reverses straight until the unchanged LiDAR
-parking-completion condition is reached.
+for five seconds. It then performs two existing LiDAR corrections followed by
+one 0.5-second parallel-alignment correction using whichever parked vehicle
+has the clearest, longest visible side edge. It stops to center steering and reverses
+straight until the unchanged LiDAR parking-completion condition is reached.
 Parking completes when either original parked vehicle, not a later pillar or
 unit, disappears below the rear-mounted LiDAR's horizontal x=0 line. The
 controller waits while stopped, then runs the configured timed exit sequence.
@@ -32,9 +33,8 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, LaserScan
-from std_msgs.msg import Int16MultiArray
+from std_msgs.msg import Int16, Int16MultiArray
 
 
 class ParkingState(str, Enum):
@@ -86,6 +86,14 @@ class ParkingPair:
 
 
 @dataclass
+class VehicleEdgeEstimate:
+    angle_deg: float
+    visible_span: float
+    clarity: float
+    selection_score: float
+
+
+@dataclass
 class LidarObservation:
     scan_valid: bool
     points: np.ndarray
@@ -119,6 +127,14 @@ class ParkingNodeYym(Node):
 
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('motor_topic', '/motor_control')
+        self.declare_parameter(
+            'steering_calibration_request_topic',
+            '/steering/calibrate_center',
+        )
+        self.declare_parameter(
+            'steering_calibration_status_topic',
+            '/steering/calibration',
+        )
         self.declare_parameter('control_hz', 20.0)
         self.declare_parameter('scan_timeout_sec', 0.5)
         self.declare_parameter('scan_quality_min_points', 10)
@@ -141,12 +157,14 @@ class ParkingNodeYym(Node):
         self.declare_parameter('valid_sector_max_abs_deg', 125.0)
         self.declare_parameter('parking_min_range_m', 0.15)
         self.declare_parameter('cluster_max_range_m', 4.0)
-        # Allow slightly farther parked vehicles only while acquiring the
+        # Use the scan's full advertised range only while acquiring the
         # initial two-vehicle gap before the first reverse segment.
-        self.declare_parameter('initial_gap_cluster_max_range_m', 6.0)
-        self.declare_parameter('cluster_neighbor_distance_m', 0.20)
-        self.declare_parameter('cluster_min_points', 7)
-        self.declare_parameter('obstacle_min_extent_m', 0.22)
+        # Zero uses the LaserScan message's full advertised range while the
+        # first parking pair is being acquired.
+        self.declare_parameter('initial_gap_cluster_max_range_m', 0.0)
+        self.declare_parameter('cluster_neighbor_distance_m', 0.25)
+        self.declare_parameter('cluster_min_points', 5)
+        self.declare_parameter('obstacle_min_extent_m', 0.15)
         self.declare_parameter('right_detection_margin_m', 0.12)
         # Before the 1 m/five-second latch, only clusters on or below the
         # green horizontal x=0 line can represent the two parked vehicles.
@@ -158,13 +176,13 @@ class ParkingNodeYym(Node):
         # Recognition only: distant wall/noise clusters must not trigger the
         # timed left turn. Parking-mode clustering keeps its full 4 m range.
         self.declare_parameter('first_car_max_distance_m', 2.0)
-        # During the initial straight approach, ignore clusters whose center
+        # During the initial approach, ignore clusters whose center
         # lies behind the LiDAR/green horizontal x=0 line.
         self.declare_parameter('first_car_min_center_x_m', 0.10)
         # Apply the same boundary to individual points before clustering so
         # rear noise cannot merge with front returns and shift the center.
         self.declare_parameter('recognition_vehicle_min_x_m', 0.05)
-        self.declare_parameter('gap_confirm_frames', 3)
+        self.declare_parameter('gap_confirm_frames', 2)
         self.declare_parameter('gap_min_width_m', 0.48)
         self.declare_parameter('gap_max_width_m', 1.40)
         self.declare_parameter('gap_track_max_center_m', 0.85)
@@ -186,7 +204,7 @@ class ParkingNodeYym(Node):
         self.declare_parameter('exit_wait_after_park_sec', 2.0)
         self.declare_parameter('exit_forward_duration_sec', 3.0)
         self.declare_parameter('exit_right_turn_duration_sec', 10.0)
-        self.declare_parameter('exit_final_forward_duration_sec', 10.0)
+        self.declare_parameter('exit_final_forward_duration_sec', 15.0)
         self.declare_parameter('exit_right_steer_deg', 45)
         self.declare_parameter('exit_speed', 110)
         # Real-vehicle testing showed the raw geometric angle was too weak.
@@ -197,7 +215,8 @@ class ParkingNodeYym(Node):
             'pre_final_alignment_steer_multiplier', 5.0
         )
         # Use gentler corrections after the 1 m trigger and five-second stop.
-        self.declare_parameter('final_reverse_steer_multiplier', 5.0)
+        self.declare_parameter('final_line_steer_multiplier', 5.0)
+        self.declare_parameter('final_reverse_steer_multiplier', 3.0)
         self.declare_parameter('final_line_alignment_tolerance_deg', 3.0)
         # A cardboard-box vehicle often appears as an L shape. Estimate its
         # longitudinal tilt from the gap-facing edge and reject short cross
@@ -208,6 +227,9 @@ class ParkingNodeYym(Node):
         self.declare_parameter('final_edge_max_abs_angle_deg', 45.0)
         self.declare_parameter('final_correction_duration_sec', 0.5)
         self.declare_parameter('final_correction_segment_count', 2)
+        self.declare_parameter(
+            'longest_edge_correction_segment_count', 1
+        )
         self.declare_parameter('steer_settle_sec', 0.6)
         # Recognition test: after steering settles at -45 degrees, drive for
         # this calibrated duration with maximum left steering, then stop.
@@ -216,6 +238,10 @@ class ParkingNodeYym(Node):
         self.declare_parameter('recognition_shutdown_delay_sec', 0.5)
         self.declare_parameter('approach_timeout_sec', 30.0)
         self.declare_parameter('gap_acquire_timeout_sec', 4.0)
+        # If no pair is visible after the initial stationary search, reverse
+        # straight in one-second steps and stop between steps to search again.
+        self.declare_parameter('gap_search_reverse_duration_sec', 1.0)
+        self.declare_parameter('gap_search_stop_duration_sec', 0.4)
         # Zero disables the elapsed-time stop. Parking depth is determined by
         # the rear-half LiDAR point condition below, not a guessed duration.
         self.declare_parameter('reverse_timeout_sec', 0.0)
@@ -223,7 +249,10 @@ class ParkingNodeYym(Node):
         # center/steering target before the next segment.
         self.declare_parameter('reverse_segment_duration_sec', 1.0)
         self.declare_parameter('reverse_measure_stop_sec', 0.4)
-        self.declare_parameter('vehicle_pair_track_max_jump_m', 1.25)
+        self.declare_parameter('vehicle_pair_track_max_jump_m', 1.50)
+        # Brief LiDAR fragmentation must not reset MEASURE_STOP forever.
+        # Reuse the most recent valid pair only for this short grace window.
+        self.declare_parameter('vehicle_pair_loss_grace_sec', 0.8)
         # Retained for compatibility with older launch parameter files and
         # the unused single-vehicle fallback helper. The tighter tracker
         # prevents a pillar/next unit from replacing an original vehicle.
@@ -305,6 +334,12 @@ class ParkingNodeYym(Node):
 
         self.scan_topic = str(self._value('scan_topic'))
         self.motor_topic = str(self._value('motor_topic'))
+        self.steering_calibration_request_topic = str(
+            self._value('steering_calibration_request_topic')
+        )
+        self.steering_calibration_status_topic = str(
+            self._value('steering_calibration_status_topic')
+        )
         self.control_hz = max(1.0, float(self._value('control_hz')))
         self.scan_timeout = max(0.05, float(self._value('scan_timeout_sec')))
         self.scan_quality_min_points = int(self._value('scan_quality_min_points'))
@@ -344,9 +379,8 @@ class ParkingNodeYym(Node):
             self.parking_min_range,
             float(self._value('cluster_max_range_m')),
         )
-        self.initial_gap_cluster_max_range = max(
-            self.cluster_max_range,
-            float(self._value('initial_gap_cluster_max_range_m')),
+        self.initial_gap_cluster_max_range = float(
+            self._value('initial_gap_cluster_max_range_m')
         )
         self.cluster_neighbor_distance = max(
             0.02, float(self._value('cluster_neighbor_distance_m'))
@@ -443,6 +477,9 @@ class ParkingNodeYym(Node):
         self.final_reverse_steer_multiplier = max(
             0.0, float(self._value('final_reverse_steer_multiplier'))
         )
+        self.final_line_steer_multiplier = max(
+            0.0, float(self._value('final_line_steer_multiplier'))
+        )
         self.final_line_alignment_tolerance = max(
             0.0,
             float(self._value('final_line_alignment_tolerance_deg')),
@@ -465,6 +502,14 @@ class ParkingNodeYym(Node):
         self.final_correction_segment_count = max(
             1, int(self._value('final_correction_segment_count'))
         )
+        self.longest_edge_correction_segment_count = max(
+            1,
+            int(self._value('longest_edge_correction_segment_count')),
+        )
+        self.total_final_correction_segment_count = (
+            self.final_correction_segment_count
+            + self.longest_edge_correction_segment_count
+        )
         self.steer_settle_sec = float(self._value('steer_settle_sec'))
         self.left_turn_duration_sec = max(
             0.1, float(self._value('left_turn_duration_sec'))
@@ -475,6 +520,12 @@ class ParkingNodeYym(Node):
         self.approach_timeout = float(self._value('approach_timeout_sec'))
         self.gap_acquire_timeout = float(
             self._value('gap_acquire_timeout_sec')
+        )
+        self.gap_search_reverse_duration = max(
+            0.1, float(self._value('gap_search_reverse_duration_sec'))
+        )
+        self.gap_search_stop_duration = max(
+            0.1, float(self._value('gap_search_stop_duration_sec'))
         )
         self.reverse_timeout = max(
             0.0, float(self._value('reverse_timeout_sec'))
@@ -487,6 +538,9 @@ class ParkingNodeYym(Node):
         )
         self.vehicle_pair_track_max_jump = max(
             0.1, float(self._value('vehicle_pair_track_max_jump_m'))
+        )
+        self.vehicle_pair_loss_grace = max(
+            0.0, float(self._value('vehicle_pair_loss_grace_sec'))
         )
         self.final_center_gain = max(
             0.0, float(self._value('final_center_gain'))
@@ -631,6 +685,7 @@ class ParkingNodeYym(Node):
         self.lidar_side_gate_frames = 0
         self.lidar_side_gate_seen = False
         self.last_pair_at: Optional[float] = None
+        self.last_valid_pair: Optional[ParkingPair] = None
         self.last_command = (0, 0)
         self.failure_reason = ''
         self.shutdown_started = False
@@ -662,6 +717,8 @@ class ParkingNodeYym(Node):
         self.invalid_scan_count = 0
         self.first_car_frames = 0
         self.gap_frames = 0
+        self.gap_search_phase = 'STATIONARY_SEARCH'
+        self.gap_search_phase_started_at = now
         self.latest_scan: Optional[LaserScan] = None
         self.observation = self._empty_observation()
         self.cv_bridge = CvBridge()
@@ -671,12 +728,28 @@ class ParkingNodeYym(Node):
         self.camera_filtered_position_error: Optional[float] = None
         self.camera_debug_image: Optional[np.ndarray] = None
         self.precision_reverse_guidance_source = 'MONITOR_ONLY'
+        self.steering_center_calibrated = False
+        self.steering_calibration_values: Optional[
+            tuple[int, int, int]
+        ] = None
+        self.last_calibration_request_at = -math.inf
 
         self.motor_publisher = self.create_publisher(
             Int16MultiArray, self.motor_topic, 10
         )
+        self.steering_calibration_request_publisher = self.create_publisher(
+            Int16,
+            self.steering_calibration_request_topic,
+            10,
+        )
         self.create_subscription(
             LaserScan, self.scan_topic, self.scan_callback, 10
+        )
+        self.create_subscription(
+            Int16MultiArray,
+            self.steering_calibration_status_topic,
+            self.steering_calibration_status_callback,
+            10,
         )
         self.create_timer(1.0 / self.control_hz, self.control_tick)
         if self.debug_view:
@@ -684,7 +757,7 @@ class ParkingNodeYym(Node):
 
         self.get_logger().info(
             f'parking_node_yym: startup stop {self.startup_delay:.1f}s '
-            '-> straight approach -> first-car trigger -> '
+            '-> operator-set-angle approach -> first-car trigger -> '
             f'first-car range<={self.first_car_max_distance:.2f}m and '
             f'point/center-x>={self.recognition_vehicle_min_x:.2f}/'
             f'{self.first_car_min_center_x:.2f}m, '
@@ -699,7 +772,10 @@ class ParkingNodeYym(Node):
             f'-> {self.straight_reverse_radius:.2f}m ring stop for '
             f'{self.straight_reverse_stop:.1f}s '
             f'-> {self.final_correction_segment_count} x '
-            f'{self.final_correction_duration:.1f}s LiDAR corrections '
+            f'{self.final_correction_duration:.1f}s existing LiDAR '
+            f'corrections + {self.longest_edge_correction_segment_count} x '
+            f'{self.final_correction_duration:.1f}s longest-edge parallel '
+            'corrections '
             '-> mandatory stop + steer=0 settle '
             '-> steer=0 continuous reverse '
             '-> either original vehicle clears line '
@@ -716,6 +792,50 @@ class ParkingNodeYym(Node):
     def _empty_observation() -> LidarObservation:
         return LidarObservation(
             False, np.empty((0, 2)), [], [], None, None
+        )
+
+    def request_steering_center_calibration(self) -> None:
+        """Ask drive_control to make the current hand-set wheel position zero."""
+        now = time.monotonic()
+        if self.state not in (
+            ParkingState.WAIT_FOR_SCAN,
+            ParkingState.START_DELAY,
+        ):
+            self.get_logger().warning(
+                'Ignoring C calibration after the driving sequence started'
+            )
+            return
+        if now - self.last_calibration_request_at < 0.5:
+            return
+        self.last_calibration_request_at = now
+        request = Int16()
+        request.data = 1
+        self.steering_calibration_request_publisher.publish(request)
+        self.get_logger().info(
+            'C pressed: requesting current steering resistance as center'
+        )
+
+    def steering_calibration_status_callback(
+        self, msg: Int16MultiArray
+    ) -> None:
+        """Unlock startup after drive_control confirms center calibration."""
+        if len(msg.data) < 3:
+            return
+        left, center, right = (int(value) for value in msg.data[:3])
+        if not left > center > right:
+            self.get_logger().warning(
+                'Ignoring invalid steering calibration status '
+                f'{left}/{center}/{right}'
+            )
+            return
+        self.steering_center_calibrated = True
+        self.steering_calibration_values = (left, center, right)
+        if self.state == ParkingState.START_DELAY:
+            self.startup_delay_deadline = time.monotonic() + self.startup_delay
+        self.get_logger().info(
+            'Steering calibration confirmed: '
+            f'left/center/right={left}/{center}/{right}; '
+            f'starting {self.startup_delay:.1f}s startup delay'
         )
 
     def scan_callback(self, msg: LaserScan) -> None:
@@ -756,6 +876,7 @@ class ParkingNodeYym(Node):
         self.observation = observation
         if observation.pair is not None:
             self.last_pair_at = now
+            self.last_valid_pair = observation.pair
         if self.state == ParkingState.REVERSE_CENTER:
             self.update_rear_half_stop_observation(observation)
             self.update_straight_reverse_condition(observation.vehicles)
@@ -793,6 +914,17 @@ class ParkingNodeYym(Node):
             )
         else:
             self.gap_frames = 0
+
+    def publish_drive_without_steering(self, speed: int) -> None:
+        """Drive with steering-motor PWM explicitly disabled."""
+        speed = int(max(-130, min(130, speed)))
+        self.last_command = (0, speed)
+        message = Int16MultiArray()
+        # Third field 0 asks the paired drive_control node to pass drive PWM
+        # while keeping steering-motor PWM exactly zero. The first field is a
+        # placeholder and is deliberately not interpreted in this mode.
+        message.data = [0, speed, 0]
+        self.motor_publisher.publish(message)
 
     def high_camera_callback(self, msg: Image) -> None:
         """Extract the slot-specific white-line pose from the high camera."""
@@ -1301,6 +1433,21 @@ class ParkingNodeYym(Node):
         """Reuse the last steering target already sent through /motor_control."""
         return int(self.last_command[0])
 
+    def current_or_recent_parking_pair(
+        self, now: float
+    ) -> Optional[ParkingPair]:
+        """Bridge a short LiDAR pair dropout with the last valid geometry."""
+        if self.observation.pair is not None:
+            return self.observation.pair
+        if (
+            self.last_valid_pair is not None
+            and self.last_pair_at is not None
+            and now - self.last_pair_at <= self.vehicle_pair_loss_grace
+        ):
+            self.precision_reverse_guidance_source = 'RECENT_PAIR_GRACE'
+            return self.last_valid_pair
+        return None
+
     def update_rear_half_stop_observation(
         self, observation: LidarObservation
     ) -> None:
@@ -1459,18 +1606,23 @@ class ParkingNodeYym(Node):
                 'Final correction latched: a parked-vehicle point entered '
                 f'the {self.straight_reverse_radius:.2f}m ring; stopping for '
                 f'{self.straight_reverse_stop:.1f}s with steer=0 before '
-                'the final two LiDAR corrections.'
+                f'the final {self.total_final_correction_segment_count} '
+                'LiDAR corrections.'
             )
 
     def observe(self, msg: LaserScan) -> LidarObservation:
         points: list[tuple[float, float]] = []
         rear_distances: list[float] = []
         scan_point_count = 0
-        vehicle_cluster_max_range = (
-            self.initial_gap_cluster_max_range
-            if self.state == ParkingState.SETTLE_AND_ACQUIRE_GAP
-            else self.cluster_max_range
-        )
+        if self.state == ParkingState.SETTLE_AND_ACQUIRE_GAP:
+            vehicle_cluster_max_range = float(msg.range_max)
+            if self.initial_gap_cluster_max_range > 0.0:
+                vehicle_cluster_max_range = min(
+                    vehicle_cluster_max_range,
+                    self.initial_gap_cluster_max_range,
+                )
+        else:
+            vehicle_cluster_max_range = self.cluster_max_range
 
         for index, raw_distance in enumerate(msg.ranges):
             distance = float(raw_distance)
@@ -1527,7 +1679,14 @@ class ParkingNodeYym(Node):
                 vehicle.y_max - vehicle.y_min,
             ) >= self.obstacle_min_extent
         ]
-        vehicles.sort(key=lambda item: len(item.points), reverse=True)
+        if self.state == ParkingState.SETTLE_AND_ACQUIRE_GAP:
+            # The LiDAR is at the rear of the ego vehicle. During initial gap
+            # search, keep only the two physically nearest obstacle clusters;
+            # farther clusters are irrelevant course units/noise.
+            vehicles.sort(key=self.vehicle_nearest_distance)
+            vehicles = vehicles[:2]
+        else:
+            vehicles.sort(key=lambda item: len(item.points), reverse=True)
         right_vehicles = [
             item for item in vehicles
             if item.center[1] < -self.right_detection_margin
@@ -1766,9 +1925,14 @@ class ParkingNodeYym(Node):
         self.state_started_at = now
         if next_state == ParkingState.SETTLE_AND_ACQUIRE_GAP:
             self.gap_frames = 0
+            self.gap_search_phase = 'STATIONARY_SEARCH'
+            self.gap_search_phase_started_at = now
+            self.last_pair_at = None
+            self.last_valid_pair = None
         elif next_state == ParkingState.REVERSE_CENTER:
             self.last_pair_at = now
             pair = self.observation.pair
+            self.last_valid_pair = pair
             self.lower_vehicle_track_center = (
                 pair.lower.center.copy() if pair is not None else None
             )
@@ -1867,18 +2031,32 @@ class ParkingNodeYym(Node):
             if self.invalid_scan_count >= self.invalid_scan_confirm_frames:
                 self.get_logger().error('Invalid LiDAR stream: emergency stop')
                 self.transition(ParkingState.EMERGENCY_STOP, now)
-            self.publish_control(0, 0)
+                self.publish_control(0, 0)
+                return
+            if self.state in (
+                ParkingState.START_DELAY,
+                ParkingState.APPROACH_FIRST_CAR,
+            ):
+                self.publish_drive_without_steering(0)
+            else:
+                self.publish_control(0, 0)
             return
 
         if self.state == ParkingState.WAIT_FOR_SCAN:
             self.transition(ParkingState.START_DELAY, now)
-            self.publish_control(0, 0)
+            if self.steering_center_calibrated:
+                self.startup_delay_deadline = now + self.startup_delay
+            self.publish_drive_without_steering(0)
             return
 
         if self.state == ParkingState.START_DELAY:
+            if not self.steering_center_calibrated:
+                self.reverse_phase = 'WAIT_PRESS_C_FOR_STEERING_CENTER'
+                self.publish_drive_without_steering(0)
+                return
             remaining = max(0.0, self.startup_delay_deadline - now)
             self.reverse_phase = f'START_DELAY_{remaining:.1f}s'
-            self.publish_control(0, 0)
+            self.publish_drive_without_steering(0)
             if remaining <= 0.0:
                 if self.mode == ParkingMode.PARKING:
                     self.transition(
@@ -1900,8 +2078,9 @@ class ParkingNodeYym(Node):
                 self.transition(ParkingState.SET_LEFT_STEER, now)
                 self.publish_control(self.left_max_steer, 0)
                 return
-            # Approach always requests an explicit straight wheel angle.
-            self.publish_control(0, self.approach_speed)
+            # Keep the operator-set physical wheel angle untouched until the
+            # first parked vehicle is recognized.
+            self.publish_drive_without_steering(self.approach_speed)
             return
 
         if self.state == ParkingState.SET_LEFT_STEER:
@@ -1938,9 +2117,6 @@ class ParkingNodeYym(Node):
             return
 
         if self.state == ParkingState.SETTLE_AND_ACQUIRE_GAP:
-            if elapsed >= self.gap_acquire_timeout:
-                self.fail('two-vehicle parking gap acquisition timeout', now)
-                return
             if (
                 elapsed >= self.steer_settle_sec
                 and self.gap_frames >= self.gap_confirm_frames
@@ -1968,7 +2144,52 @@ class ParkingNodeYym(Node):
                         'strict gap pair remains preferred when available'
                     )
                 self.transition(ParkingState.REVERSE_CENTER, now)
+                self.publish_control(0, 0)
+                return
+
+            gap_phase_elapsed = now - self.gap_search_phase_started_at
+            if self.gap_search_phase == 'STATIONARY_SEARCH':
+                self.reverse_phase = 'GAP_STATIONARY_SEARCH'
+                self.publish_control(0, 0)
+                if elapsed >= self.gap_acquire_timeout:
+                    self.gap_search_phase = 'REVERSE_STEP'
+                    self.gap_search_phase_started_at = now
+                    self.reverse_phase = 'GAP_REVERSE_STEP'
+                    self.get_logger().warning(
+                        'Parking pair still not visible: replacing failure '
+                        f'with {self.gap_search_reverse_duration:.1f}s '
+                        'straight reverse search step'
+                    )
+                return
+
+            if self.gap_search_phase == 'REVERSE_STEP':
+                self.reverse_phase = 'GAP_REVERSE_STEP'
+                if (
+                    self.observation.rear_min_distance is not None
+                    and self.observation.rear_min_distance
+                    <= self.rear_hard_stop_distance
+                ):
+                    self.fail(
+                        'rear obstacle inside hard-stop distance during '
+                        'parking-gap search',
+                        now,
+                    )
+                    return
+                if gap_phase_elapsed < self.gap_search_reverse_duration:
+                    self.publish_control(0, self.reverse_speed)
+                    return
+                self.gap_search_phase = 'SEARCH_STOP'
+                self.gap_search_phase_started_at = now
+                self.reverse_phase = 'GAP_SEARCH_STOP'
+                self.publish_control(0, 0)
+                return
+
+            self.reverse_phase = 'GAP_SEARCH_STOP'
             self.publish_control(0, 0)
+            if gap_phase_elapsed >= self.gap_search_stop_duration:
+                self.gap_search_phase = 'REVERSE_STEP'
+                self.gap_search_phase_started_at = now
+                self.reverse_phase = 'GAP_REVERSE_STEP'
             return
 
         if self.state == ParkingState.REVERSE_CENTER:
@@ -2016,8 +2237,12 @@ class ParkingNodeYym(Node):
                         'Five-second stop complete: starting '
                         f'{self.final_correction_segment_count} x '
                         f'{self.final_correction_duration:.1f}s LiDAR '
-                        'corrections using line angle when misaligned or '
-                        'average parked-vehicle tilt when aligned'
+                        'corrections using the line angle plus the clearest '
+                        'single parked-vehicle edge when misaligned, or only '
+                        'that edge when the line is within tolerance, followed '
+                        f'by {self.longest_edge_correction_segment_count} x '
+                        f'{self.final_correction_duration:.1f}s corrections '
+                        'parallel to the clearest, longest visible edge'
                     )
                 return
 
@@ -2059,7 +2284,7 @@ class ParkingNodeYym(Node):
                         )
                     return
 
-                pair = self.observation.pair
+                pair = self.current_or_recent_parking_pair(now)
                 if (
                     pair is None
                     and self.current_reference_lower is not None
@@ -2071,32 +2296,107 @@ class ParkingNodeYym(Node):
                         require_valid_gap=False,
                     )
                 if pair is not None:
-                    red_line_angle = self.reverse_reference_angle(pair)
-                    lines_aligned = (
-                        abs(red_line_angle)
-                        <= self.final_line_alignment_tolerance
-                    )
-                    if lines_aligned:
-                        calculated_steer = (
-                            self.final_initial_alignment_steering(pair)
+                    if self.reverse_phase in (
+                        'FINAL_STEER_SETTLE',
+                        'FINAL_DRIVE',
+                    ):
+                        # This segment's target was fixed during the preceding
+                        # stopped measurement. Do not let the next segment's
+                        # guidance rule interrupt an in-progress correction.
+                        calculated_steer = self.reverse_segment_steer
+                        target_description = 'held measured target'
+                    elif (
+                        self.final_correction_count
+                        < self.final_correction_segment_count
+                    ):
+                        longest_edge_target = (
+                            self.final_longest_edge_alignment_steering(pair)
                         )
-                        target_description = (
-                            f'lines aligned ({red_line_angle:+.1f}deg): '
-                            'average vehicle tilt='
-                            f'{self.final_average_alignment_angle(pair):+.1f}'
-                            f'deg x{self.final_reverse_steer_multiplier:.1f}'
+                        if longest_edge_target is None:
+                            self.precision_reverse_guidance_source = (
+                                'WAITING_CLEAREST_EDGE'
+                            )
+                            self.reverse_phase = 'FINAL_MEASURE_STOP'
+                            self.reverse_phase_started_at = now
+                            self.publish_control(
+                                self.held_steering_command(), 0
+                            )
+                            return
+                        (
+                            _,
+                            selected_side,
+                            selected_edge,
+                        ) = longest_edge_target
+                        red_line_angle = self.reverse_reference_angle(pair)
+                        lines_aligned = (
+                            abs(red_line_angle)
+                            <= self.final_line_alignment_tolerance
+                        )
+                        alignment_command = (
+                            selected_edge.angle_deg
+                            * self.final_reverse_steer_multiplier
+                        )
+                        if lines_aligned:
+                            calculated_steer = int(round(max(
+                                -45.0,
+                                min(45.0, alignment_command),
+                            )))
+                            target_description = (
+                                f'lines aligned ({red_line_angle:+.1f}deg): '
+                                f'{selected_side} clearest-edge tilt='
+                                f'{selected_edge.angle_deg:+.1f}deg x'
+                                f'{self.final_reverse_steer_multiplier:.1f}'
+                            )
+                        else:
+                            center_command = (
+                                red_line_angle
+                                * self.final_line_steer_multiplier
+                            )
+                            calculated_steer = int(round(max(
+                                -45.0,
+                                min(
+                                    45.0,
+                                    center_command + alignment_command,
+                                ),
+                            )))
+                            target_description = (
+                                f'lines misaligned '
+                                f'({red_line_angle:+.1f}deg): '
+                                f'line x{self.final_line_steer_multiplier:.1f} '
+                                f'+ {selected_side} clearest-edge '
+                                f'{selected_edge.angle_deg:+.1f}deg x'
+                                f'{self.final_reverse_steer_multiplier:.1f}'
+                            )
+                        target_description += (
+                            f', span={selected_edge.visible_span:.2f}m '
+                            f'clarity={selected_edge.clarity:.2f}'
                         )
                     else:
-                        calculated_steer = self.reverse_steering(pair)
-                        target_description = (
-                            f'lines misaligned ({red_line_angle:+.1f}deg): '
-                            f'line angle x{self.reverse_steer_multiplier:.1f}'
+                        longest_edge_target = (
+                            self.final_longest_edge_alignment_steering(pair)
                         )
-                    target_description += (
-                        f', axes='
-                        f'{math.degrees(pair.lower.axis_angle):+.0f}/'
-                        f'{math.degrees(pair.upper.axis_angle):+.0f}deg'
-                    )
+                        if longest_edge_target is None:
+                            self.precision_reverse_guidance_source = (
+                                'WAITING_LONGEST_EDGE'
+                            )
+                            self.reverse_phase = 'FINAL_MEASURE_STOP'
+                            self.reverse_phase_started_at = now
+                            self.publish_control(
+                                self.held_steering_command(), 0
+                            )
+                            return
+                        (
+                            calculated_steer,
+                            selected_side,
+                            selected_edge,
+                        ) = longest_edge_target
+                        target_description = (
+                            f'clearest/longest {selected_side} gap-facing '
+                            f'edge: angle={selected_edge.angle_deg:+.1f}deg, '
+                            f'span={selected_edge.visible_span:.2f}m, '
+                            f'clarity={selected_edge.clarity:.2f} x'
+                            f'{self.final_reverse_steer_multiplier:.1f}'
+                        )
                 else:
                     self.precision_reverse_guidance_source = 'WAITING_SENSOR'
                     self.reverse_phase = 'FINAL_MEASURE_STOP'
@@ -2125,14 +2425,15 @@ class ParkingNodeYym(Node):
                     ):
                         if (
                             self.final_correction_count
-                            >= self.final_correction_segment_count
+                            >= self.total_final_correction_segment_count
                         ):
                             self.reverse_phase = 'FINAL_ZERO_STEER_SETTLE'
                             self.reverse_phase_started_at = now
                             self.publish_control(0, 0)
                             self.get_logger().info(
-                                f'{self.final_correction_segment_count} '
-                                'LiDAR corrections complete: mandatory stop '
+                                f'{self.total_final_correction_segment_count} '
+                                'LiDAR corrections complete (existing + '
+                                'longest-edge parallel): mandatory stop '
                                 'and steer=0 centering before straight reverse'
                             )
                             return
@@ -2166,7 +2467,7 @@ class ParkingNodeYym(Node):
                 return
 
             if self.reverse_phase in lidar_reverse_phases:
-                pair = self.observation.pair
+                pair = self.current_or_recent_parking_pair(now)
                 if pair is None:
                     self.reverse_phase = 'MEASURE_STOP'
                     self.reverse_phase_started_at = now
@@ -2370,14 +2671,13 @@ class ParkingNodeYym(Node):
         vehicle: VehicleCluster,
         *,
         is_lower: bool,
-    ) -> Optional[tuple[float, float]]:
+    ) -> Optional[VehicleEdgeEstimate]:
         """Fit one vehicle's gap-facing longitudinal edge.
 
         ``is_lower`` is the right-side vehicle in the debug/LiDAR view, so
         its upper y edge faces the gap. The left vehicle uses its lower edge.
-        Returns ``(angle_degrees, x_span)`` only for a sufficiently long,
-        longitudinal edge; short transverse box faces are intentionally
-        rejected.
+        Returns angle, visible span, and line clarity only for a sufficiently
+        long longitudinal edge. Short transverse box faces are rejected.
         """
         points = vehicle.points
         if len(points) < self.final_edge_min_bin_count * 2:
@@ -2408,13 +2708,27 @@ class ParkingNodeYym(Node):
         if len(edge_points) < self.final_edge_min_bin_count:
             return None
         edge_array = np.asarray(edge_points, dtype=np.float64)
-        fitted_slope = float(np.polyfit(
+        fitted_slope, fitted_intercept = np.polyfit(
             edge_array[:, 0], edge_array[:, 1], 1
-        )[0])
+        )
+        fitted_slope = float(fitted_slope)
+        fitted_intercept = float(fitted_intercept)
         angle = math.degrees(math.atan(fitted_slope))
         if abs(angle) > self.final_edge_max_abs_angle:
             return None
-        return angle, x_span
+        visible_span = float(np.ptp(edge_array[:, 0]))
+        residuals = edge_array[:, 1] - (
+            fitted_slope * edge_array[:, 0] + fitted_intercept
+        )
+        rmse = float(np.sqrt(np.mean(np.square(residuals))))
+        coverage = len(edge_points) / self.final_edge_bin_count
+        clarity = coverage * math.exp(-rmse / 0.05)
+        return VehicleEdgeEstimate(
+            angle_deg=angle,
+            visible_span=visible_span,
+            clarity=clarity,
+            selection_score=visible_span * clarity,
+        )
 
     def final_average_alignment_angle(self, pair: ParkingPair) -> float:
         """Return a span-weighted mean of reliable longitudinal edges."""
@@ -2425,11 +2739,11 @@ class ParkingNodeYym(Node):
         valid_estimates = [item for item in estimates if item is not None]
         if not valid_estimates:
             return 0.0
-        total_span = sum(item[1] for item in valid_estimates)
+        total_span = sum(item.visible_span for item in valid_estimates)
         if total_span <= 0.0:
             return 0.0
         return sum(
-            angle * span for angle, span in valid_estimates
+            item.angle_deg * item.visible_span for item in valid_estimates
         ) / total_span
 
     def final_initial_alignment_steering(
@@ -2440,6 +2754,37 @@ class ParkingNodeYym(Node):
             self.final_average_alignment_angle(pair),
             multiplier=self.final_reverse_steer_multiplier,
         )
+
+    def final_longest_edge_alignment_steering(
+        self, pair: ParkingPair
+    ) -> Optional[tuple[int, str, VehicleEdgeEstimate]]:
+        """Parallelize with the clearest, longest gap-facing vehicle edge.
+
+        If neither side has a reliable longitudinal edge, the vehicle remains
+        stopped and waits for another LiDAR observation.
+        """
+        candidates: list[tuple[str, VehicleEdgeEstimate]] = []
+        lower_edge = self.final_vehicle_gap_edge_angle(
+            pair.lower, is_lower=True
+        )
+        if lower_edge is not None:
+            candidates.append(('right', lower_edge))
+        upper_edge = self.final_vehicle_gap_edge_angle(
+            pair.upper, is_lower=False
+        )
+        if upper_edge is not None:
+            candidates.append(('left', upper_edge))
+        if not candidates:
+            return None
+
+        selected_side, selected_edge = max(
+            candidates, key=lambda item: item[1].selection_score
+        )
+        steering = self.scaled_reverse_steering(
+            selected_edge.angle_deg,
+            multiplier=self.final_reverse_steer_multiplier,
+        )
+        return steering, selected_side, selected_edge
 
     def final_conditional_steering(self, pair: ParkingPair) -> int:
         """Choose line correction unless red and green are already aligned."""
@@ -2547,7 +2892,8 @@ class ParkingNodeYym(Node):
         speed = int(max(-130, min(130, speed)))
         self.last_command = (steer, speed)
         message = Int16MultiArray()
-        message.data = [steer, speed]
+        # Third field 1 explicitly enables normal closed-loop steering.
+        message.data = [steer, speed, 1]
         self.motor_publisher.publish(message)
 
     def draw_debug(self) -> None:
@@ -2620,7 +2966,16 @@ class ParkingNodeYym(Node):
         cv2.line(image, bumper_left, bumper_right, (255, 255, 255), 3)
 
         cv2.rectangle(image, (8, 8), (size - 8, 132), (55, 55, 55), -1)
-        if self.state in (
+        if (
+            not self.steering_center_calibrated
+            and self.state in (
+                ParkingState.WAIT_FOR_SCAN,
+                ParkingState.START_DELAY,
+            )
+        ):
+            state_text = 'MANUAL CENTER -> CLICK WINDOW -> PRESS C'
+            state_color = (0, 165, 255)
+        elif self.state in (
             ParkingState.PARKED,
             ParkingState.EXIT_COMPLETE,
         ):
@@ -2754,10 +3109,22 @@ class ParkingNodeYym(Node):
                         f'{int(self.reference_lower_gone)}'
                     )
                 else:
+                    displayed_correction_index = (
+                        self.final_correction_count + 1
+                        if self.reverse_phase == 'FINAL_MEASURE_STOP'
+                        else self.final_correction_count
+                    )
+                    correction_kind = (
+                        'existing'
+                        if displayed_correction_index
+                        <= self.final_correction_segment_count
+                        else 'longest-edge parallel'
+                    )
                     guidance_text = (
-                        f'{self.final_correction_duration:.1f}s LiDAR '
+                        f'{self.final_correction_duration:.1f}s '
+                        f'{correction_kind} LiDAR '
                         f'correction {self.final_correction_count}/'
-                        f'{self.final_correction_segment_count} | '
+                        f'{self.total_final_correction_segment_count} | '
                         f'original gone L/R='
                         f'{int(self.reference_upper_gone)}/'
                         f'{int(self.reference_lower_gone)}'
@@ -2830,7 +3197,9 @@ class ParkingNodeYym(Node):
                 self.camera_debug_window_name,
                 camera_display,
             )
-        cv2.waitKey(1)
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord('c'), ord('C')):
+            self.request_steering_center_calibration()
 
     def destroy_node(self):
         try:

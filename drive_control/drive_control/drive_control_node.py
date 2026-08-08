@@ -12,6 +12,9 @@ from std_msgs.msg import Int16, Int16MultiArray
 MOTOR_CONTROL_TOPIC = '/motor_control'
 ARDUINO_COMMAND_TOPIC = '/arduino/motor_command'
 STEERING_RAW_TOPIC = '/arduino/steering_raw'
+STEERING_CALIBRATION_REQUEST_TOPIC = '/steering/calibrate_center'
+STEERING_CALIBRATION_STATUS_TOPIC = '/steering/calibration'
+STEERING_CALIBRATION_HALF_SPAN = 100
 COMMAND_RATE = 20.0
 INPUT_TIMEOUT = 0.5
 STEERING_FEEDBACK_TIMEOUT = 0.5
@@ -20,9 +23,9 @@ MAX_DRIVE_PWM = 230
 STEER_PWM = 150
 STEER_MAX_ANGLE_DEG = 45.0
 STEER_ANGLE_TOLERANCE_DEG = 1.0
-STEER_RAW_LEFT = 560
-STEER_RAW_CENTER = 490
-STEER_RAW_RIGHT = 420
+STEER_RAW_LEFT = 550
+STEER_RAW_CENTER = 480
+STEER_RAW_RIGHT = 410
 STEER_PID_KP = 10.0
 STEER_PID_KI = 0.0
 STEER_PID_KD = 0.5
@@ -61,9 +64,6 @@ class DriveControlNode(Node):
             'steer_angle_tolerance_deg',
             STEER_ANGLE_TOLERANCE_DEG,
         )
-        self.declare_parameter('steer_raw_left', STEER_RAW_LEFT)
-        self.declare_parameter('steer_raw_center', STEER_RAW_CENTER)
-        self.declare_parameter('steer_raw_right', STEER_RAW_RIGHT)
         self.declare_parameter('steer_pid_kp', STEER_PID_KP)
         self.declare_parameter('steer_pid_ki', STEER_PID_KI)
         self.declare_parameter('steer_pid_kd', STEER_PID_KD)
@@ -113,15 +113,11 @@ class DriveControlNode(Node):
             0.0,
             float(self.get_parameter('steer_angle_tolerance_deg').value),
         )
-        self.steer_raw_left = int(
-            self.get_parameter('steer_raw_left').value
-        )
-        self.steer_raw_center = int(
-            self.get_parameter('steer_raw_center').value
-        )
-        self.steer_raw_right = int(
-            self.get_parameter('steer_raw_right').value
-        )
+        # Single source of truth for steering calibration. Change only the
+        # STEER_RAW_* constants at the top of this file.
+        self.steer_raw_left = STEER_RAW_LEFT
+        self.steer_raw_center = STEER_RAW_CENTER
+        self.steer_raw_right = STEER_RAW_RIGHT
         self.steer_pid_kp = max(
             0.0, float(self.get_parameter('steer_pid_kp').value)
         )
@@ -170,7 +166,7 @@ class DriveControlNode(Node):
             > self.steer_raw_right
         ):
             self.get_logger().warn(
-                'Invalid steering raw calibration; using 560/490/420'
+                'Invalid steering raw calibration; using 550/480/40'
             )
             self.steer_raw_left = STEER_RAW_LEFT
             self.steer_raw_center = STEER_RAW_CENTER
@@ -179,6 +175,7 @@ class DriveControlNode(Node):
         self.last_input_time = None
         self.last_steering_feedback_time = None
         self.drive_pwm = 0
+        self.steering_enabled = True
         self.target_steer_angle_deg = 0.0
         self.steer_angle_deg = 0.0
         self.steer_raw_value = None
@@ -191,6 +188,11 @@ class DriveControlNode(Node):
             self.arduino_command_topic,
             10,
         )
+        self.calibration_status_publisher = self.create_publisher(
+            Int16MultiArray,
+            STEERING_CALIBRATION_STATUS_TOPIC,
+            10,
+        )
         self.create_subscription(
             Int16MultiArray,
             self.motor_control_topic,
@@ -201,6 +203,12 @@ class DriveControlNode(Node):
             Int16,
             self.steering_raw_topic,
             self.steering_feedback_callback,
+            10,
+        )
+        self.create_subscription(
+            Int16,
+            STEERING_CALIBRATION_REQUEST_TOPIC,
+            self.center_calibration_callback,
             10,
         )
         self.create_timer(1.0 / self.command_rate_hz, self.timer_callback)
@@ -219,7 +227,19 @@ class DriveControlNode(Node):
         self.last_input_time = self.get_clock().now()
         steer = int(msg.data[0]) if len(msg.data) > 0 else 0
         speed = int(msg.data[1]) if len(msg.data) > 1 else 0
+        # Optional third field: 0 disables steering-motor output while still
+        # allowing drive PWM. Existing two-field publishers remain unchanged.
+        steering_enabled = (
+            bool(msg.data[2]) if len(msg.data) > 2 else True
+        )
         self.drive_pwm = self.limit_drive_pwm(speed)
+
+        if not steering_enabled:
+            if self.steering_enabled:
+                self.reset_pid_controller()
+            self.steering_enabled = False
+            return
+        self.steering_enabled = True
 
         previous_error = (
             self.target_steer_angle_deg - self.steer_angle_deg
@@ -261,12 +281,57 @@ class DriveControlNode(Node):
         self.steer_angle_deg = next_angle
         self.last_steering_feedback_time = now
 
+    def center_calibration_callback(self, msg):
+        """Use the current physical wheel position as zero steering."""
+        if int(msg.data) == 0:
+            return
+        now = self.get_clock().now()
+        if (
+            self.steer_raw_value is None
+            or self.is_steering_feedback_stale(now)
+        ):
+            self.get_logger().warning(
+                'Center calibration rejected: steering feedback unavailable'
+            )
+            return
+
+        center = int(self.steer_raw_value)
+        right = center - STEERING_CALIBRATION_HALF_SPAN
+        left = center + STEERING_CALIBRATION_HALF_SPAN
+        if right < 0 or left > 1023:
+            self.get_logger().error(
+                f'Center calibration rejected: raw center {center} cannot '
+                f'use +/-{STEERING_CALIBRATION_HALF_SPAN}'
+            )
+            return
+
+        self.steer_raw_left = left
+        self.steer_raw_center = center
+        self.steer_raw_right = right
+        self.target_steer_angle_deg = 0.0
+        self.steer_angle_deg = 0.0
+        self.steer_angle_velocity_deg_per_sec = 0.0
+        self.reset_pid_controller()
+
+        status = Int16MultiArray()
+        status.data = [left, center, right]
+        self.calibration_status_publisher.publish(status)
+        self.get_logger().info(
+            'Steering center calibrated from current wheel position: '
+            f'raw left/center/right={left}/{center}/{right}'
+        )
+
     def timer_callback(self):
         now = self.get_clock().now()
 
         if self.is_input_stale(now):
             self.reset_pid_controller()
             steer_pwm, drive_pwm = 0, 0
+        elif not self.steering_enabled:
+            # The caller explicitly requested free steering: never energize
+            # the steering motor, and pass only the requested drive PWM.
+            self.reset_pid_controller()
+            steer_pwm, drive_pwm = 0, self.drive_pwm
         elif self.is_steering_feedback_stale(now):
             self.reset_pid_controller()
             self.get_logger().warn(

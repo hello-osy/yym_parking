@@ -1,4 +1,10 @@
-from drive_control.drive_control_node import DriveControlNode
+from drive_control.drive_control_node import (
+    DriveControlNode,
+    STEERING_CALIBRATION_HALF_SPAN,
+    STEER_RAW_CENTER,
+    STEER_RAW_LEFT,
+    STEER_RAW_RIGHT,
+)
 
 
 class FakePublisher:
@@ -7,6 +13,22 @@ class FakePublisher:
 
     def publish(self, message):
         self.data = list(message.data)
+
+
+class FakeLogger:
+    def info(self, _message):
+        pass
+
+    def warning(self, _message):
+        pass
+
+    def error(self, _message):
+        pass
+
+
+class FakeClock:
+    def now(self):
+        return object()
 
 
 def test_pwm_command_is_published_without_serial_access():
@@ -21,9 +43,9 @@ def test_pwm_command_is_published_without_serial_access():
 
 def make_closed_loop_node():
     node = object.__new__(DriveControlNode)
-    node.steer_raw_left = 560
-    node.steer_raw_center = 490
-    node.steer_raw_right = 420
+    node.steer_raw_left = STEER_RAW_LEFT
+    node.steer_raw_center = STEER_RAW_CENTER
+    node.steer_raw_right = STEER_RAW_RIGHT
     node.steer_max_angle_deg = 45.0
     node.steer_angle_tolerance_deg = 1.0
     node.steer_pwm = 150
@@ -43,11 +65,15 @@ def make_closed_loop_node():
 def test_raw_feedback_maps_to_calibrated_angles():
     node = make_closed_loop_node()
 
-    assert node.raw_to_steer_angle(560) == -45.0
-    assert node.raw_to_steer_angle(490) == 0.0
-    assert node.raw_to_steer_angle(420) == 45.0
-    assert node.raw_to_steer_angle(525) == -22.5
-    assert node.raw_to_steer_angle(455) == 22.5
+    assert node.raw_to_steer_angle(STEER_RAW_LEFT) == -45.0
+    assert node.raw_to_steer_angle(STEER_RAW_CENTER) == 0.0
+    assert node.raw_to_steer_angle(STEER_RAW_RIGHT) == 45.0
+    assert node.raw_to_steer_angle(
+        (STEER_RAW_LEFT + STEER_RAW_CENTER) // 2
+    ) == -22.5
+    assert node.raw_to_steer_angle(
+        (STEER_RAW_CENTER + STEER_RAW_RIGHT) // 2
+    ) == 22.5
 
 
 def test_positive_error_commands_right_pwm():
@@ -91,3 +117,21 @@ def test_pid_integral_is_bounded_during_saturation():
         assert node.calculate_steer_pwm(0.05) == 150
 
     assert node.pid_integral_error == 0.0
+
+
+def test_center_calibration_uses_current_raw_value_and_fixed_span():
+    node = make_closed_loop_node()
+    node.steer_raw_value = 512
+    node.last_pid_update_time = None
+    node.calibration_status_publisher = FakePublisher()
+    node.get_clock = lambda: FakeClock()
+    node.get_logger = lambda: FakeLogger()
+    node.is_steering_feedback_stale = lambda _now: False
+    request = type('Request', (), {'data': 1})()
+
+    node.center_calibration_callback(request)
+
+    assert node.steer_raw_center == 512
+    assert node.steer_raw_left == 512 + STEERING_CALIBRATION_HALF_SPAN
+    assert node.steer_raw_right == 512 - STEERING_CALIBRATION_HALF_SPAN
+    assert node.calibration_status_publisher.data == [612, 512, 412]

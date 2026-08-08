@@ -1,17 +1,17 @@
 # YYM 주차 노드 인수인계 문서
 
-작성일: 2026-08-05  
-대상 파일: `parking_node_yym.py`  
+최종 갱신일: 2026-08-08
+대상 파일: `parking_node_yym.py`
 절대 경로: `/home/hailab/osy/260711/ai-autonomous-driving-competition-2026/parking/parking/parking_node_yym.py`
 
 ## 현재 기준점
 
-이 문서는 2026-08-04 16:37:37에 마지막 수정된 파일을 기준으로 작성했다. 이 시점은 사용자가 “5초 정지 후 0.5초 보정을 3번 말고 2번만 하자”라고 요청한 내용까지 반영된 상태다.
+이 문서는 Git 커밋 `df607c6`의 현재 파일을 기준으로 갱신했다. 대화 시작 당시 원본은 커밋 `5b91025`였으며, 현재는 최초 차량 인식 완화, 첫 후진 시작 시 원거리 pair 획득, 5초 정지 전 차량 기울기 보정, 주차 후 출차 활성화까지 반영되어 있다.
 
 작성 시점 파일 SHA-256:
 
 ```text
-ad22e067f06fde1b9fd2794f9b8685c51de19cce28b0a235fb14144626d824d7
+d6e378925171b3e752405ef0c153589bcbcf503b4c6219bac6dcdce072eaa868
 ```
 
 다른 세션에서 작업을 이어갈 때 먼저 실제 파일의 해시와 Git 변경사항을 확인해야 한다. 이후 수정이 있었다면 이 문서보다 실제 코드를 우선한다.
@@ -66,14 +66,14 @@ REAR 0° | RIGHT +90° | FRONT ±180° | LEFT -90°
 ### 2. 첫 차량 인식
 
 1. `APPROACH_FIRST_CAR`에서 `steer=0`, `speed=110`으로 직진한다.
-2. 인식 모드에서는 후방 노이즈를 제거하기 위해 `x>=0.15m`인 전방 점만 클러스터링한다.
+2. 인식 모드에서는 후방 노이즈를 제거하기 위해 `x>=0.05m`인 전방 점만 클러스터링한다.
 3. 첫 차량 후보는 다음 조건을 모두 만족해야 한다.
    - 우측 차량 후보
-   - 클러스터 중심 `x>=0.25m`
+   - 클러스터 중심 `x>=0.10m`
    - 최근접 거리 2.0m 이하
-   - 점 12개 이상
-   - x/y 최대 크기 0.30m 이상
-   - 5프레임 연속 검출
+   - 점 7개 이상
+   - x/y 최대 크기 0.22m 이상
+   - 2프레임 연속 검출
 4. 이 필터는 첫 차량을 찾는 인식 모드에만 적용된다.
 
 ### 3. 시간 기반 최대 좌회전
@@ -91,20 +91,23 @@ REAR 0° | RIGHT +90° | FRONT ±180° | LEFT -90°
 3. 엄격한 pair가 없더라도 두 클러스터가 명확하면 fallback midpoint pair를 사용할 수 있다.
 4. pair가 3프레임 연속 유지되고 조향 정렬 시간이 지나면 `REVERSE_CENTER`로 전환한다.
 5. 4초 안에 pair를 획득하지 못하면 `PARKING_FAILED`가 된다.
+6. 이 최초 pair 획득 상태에서만 차량 클러스터 최대 거리를 6.0m로 늘린다.
+7. 후진이 시작되면 클러스터 최대 거리는 기존 4.0m로 즉시 돌아간다.
 
 ### 5. 1m 원 진입 전 후진
 
 다음 동작을 반복한다.
 
 1. 정지 상태에서 두 차량 기준점의 중간과 초록 세로선 사이 빨간선 각도를 계산한다.
-2. 각도에 `reverse_steer_multiplier=10`을 곱한다.
-3. 결과를 `±45°`로 제한한다.
-4. 정지 상태에서 계산 조향각을 0.6초 맞춘다.
-5. 같은 조향으로 1초 동안 `speed=-110` 후진한다.
-6. 현재 조향을 유지한 상태로 0.4초 정지한다.
-7. LiDAR pair와 조향각을 다시 계산한다.
+2. 빨간선 각도에 `reverse_steer_multiplier=10`을 곱한다.
+3. 양쪽 차량의 gap-facing 세로 경계 기울기를 구하고 `pre_final_alignment_steer_multiplier=5`를 곱한다.
+4. 두 값을 더한 뒤 결과를 `±45°`로 제한한다.
+5. 정지 상태에서 계산 조향각을 0.6초 맞춘다.
+6. 같은 조향으로 1초 동안 `speed=-110` 후진한다.
+7. 현재 조향을 유지한 상태로 0.4초 정지한다.
+8. LiDAR pair와 조향각을 다시 계산한다.
 
-5초 이전 로직은 실차 테스트에서 비교적 잘 동작한다고 판단되어 함부로 변경하지 않는 것이 좋다.
+사용자의 명시적 요청으로 이 구간에도 차량 기울기 `×5`가 추가되었다. 이후에는 이 결합 조향을 기준으로 보존하고, 별도 요청 없이 배율이나 시퀀스를 바꾸지 않는다.
 
 ### 6. 1m 원 진입과 5초 정지
 
@@ -152,14 +155,19 @@ rosbag 검증에서 연속 후진 구간은 실제로 `steer=0`이었고 조향 
 
 기울기 보정 배율은 `final_reverse_steer_multiplier=5`다.
 
-### 9. 주차 완료와 대기
+### 9. 주차 완료와 출차
 
 - 5초 정지 이후부터 처음 선택했던 좌우 차량을 계속 추적한다.
 - 각 기준 차량에 대해 초록 가로선 아래, 즉 `x<0`인 점의 존재 여부를 확인한다.
 - 좌측 또는 우측 기준 차량 중 **하나라도** 초록 가로선 아래에서 3프레임 연속 사라지면 `PARKED`가 된다.
-- `PARKED`는 현재 터미널 상태로 처리된다.
-- 이후 계속 `steer/speed=0/0`, `PARKED_HOLD`로 대기한다.
-- 출차 enum, 파라미터와 일부 코드는 파일에 남아 있지만 `PARKED`에서 출차 상태로 진입하는 경로는 비활성화되어 있다.
+- `PARKED`가 되면 `steer/speed=0/0`으로 2초 정지한다.
+- 이후 출차 모드로 전환한다.
+- `steer=0`, `speed=110`으로 3초 전진한다.
+- 정지 상태에서 우조향 `+45°`를 0.6초 맞춘다.
+- `steer=+45`, `speed=110`으로 10초 우회전 전진한다.
+- 정지 상태에서 `steer=0`을 0.6초 맞춘다.
+- `steer=0`, `speed=110`으로 10초 전진한다.
+- 마지막에 `EXIT_COMPLETE`로 전환해 `steer/speed=0/0`을 계속 발행한다.
 
 ## LiDAR 클러스터와 pair 생성
 
@@ -167,7 +175,8 @@ rosbag 검증에서 연속 후진 구간은 실제로 `steer=0`이었고 조향 
 
 - 사용 각도 영역: 후방 0° 기준 `±125°`
 - 최소 거리: 0.15m
-- 최대 거리: 4.0m
+- 최대 거리: 기본 4.0m
+- 첫 후진 시작 전 `SETTLE_AND_ACQUIRE_GAP`에서만 최대 6.0m
 - connected-component 점 간 거리: 0.20m
 - 최소 점 개수: 7
 - 최소 장애물 크기: 0.22m
@@ -189,7 +198,8 @@ pair 처리:
 - 첫 차량을 30초 안에 찾지 못하면 `PARKING_FAILED`.
 - 주차 pair를 4초 안에 얻지 못하면 `PARKING_FAILED`.
 - 1m latch 전 후방 `±11°`에서 0.18m 이하 물체가 감지되면 실패 처리한다.
-- `PARKED`, `PARKING_FAILED`, `EMERGENCY_STOP`, `EXIT_COMPLETE`는 `steer/speed=0/0`을 계속 발행하는 terminal hold 상태다.
+- `PARKING_FAILED`, `EMERGENCY_STOP`, `EXIT_COMPLETE`는 `steer/speed=0/0`을 계속 발행하는 terminal hold 상태다.
+- `PARKED`는 2초 정지 후 출차로 넘어가는 중간 상태다.
 
 ## 주요 파라미터
 
@@ -202,15 +212,18 @@ pair 처리:
 | `left_max_steer_deg` | -45 | 최대 좌조향 |
 | `left_turn_duration_sec` | 7.0 | 시간 기반 좌회전 시간 |
 | `first_car_max_distance_m` | 2.0 | 첫 차량 최대 감지 거리 |
-| `first_car_confirm_frames` | 5 | 첫 차량 연속 확인 프레임 |
-| `recognition_vehicle_min_x_m` | 0.15 | 인식용 전방 점 최소 x |
-| `first_car_min_center_x_m` | 0.25 | 첫 차량 중심 최소 x |
-| `first_car_min_points` | 12 | 첫 차량 최소 점 개수 |
-| `first_car_min_extent_m` | 0.30 | 첫 차량 최소 크기 |
+| `first_car_confirm_frames` | 2 | 첫 차량 연속 확인 프레임 |
+| `recognition_vehicle_min_x_m` | 0.05 | 인식용 전방 점 최소 x |
+| `first_car_min_center_x_m` | 0.10 | 첫 차량 중심 최소 x |
+| `first_car_min_points` | 7 | 첫 차량 최소 점 개수 |
+| `first_car_min_extent_m` | 0.22 | 첫 차량 최소 크기 |
+| `cluster_max_range_m` | 4.0 | 일반 차량 클러스터 최대 거리 |
+| `initial_gap_cluster_max_range_m` | 6.0 | 첫 후진 시작 전 pair 획득 최대 거리 |
 | `reverse_segment_duration_sec` | 1.0 | 1m 전 보정 후진 시간 |
 | `reverse_measure_stop_sec` | 0.4 | 재계산 전 정지 시간 |
 | `steer_settle_sec` | 0.6 | 정지 조향 정렬 시간 |
 | `reverse_steer_multiplier` | 10.0 | 빨간선 보정 배율 |
+| `pre_final_alignment_steer_multiplier` | 5.0 | 5초 정지 전 차량 세로 경계 보정 배율 |
 | `straight_reverse_radius_m` | 1.0 | 최종 단계 진입 반경 |
 | `straight_reverse_stop_sec` | 5.0 | 최종 단계 전 정지 시간 |
 | `final_line_alignment_tolerance_deg` | 3.0 | 빨간선 우선 보정 허용 범위 |
@@ -221,6 +234,12 @@ pair 처리:
 | `rear_half_empty_confirm_frames` | 3 | 주차 완료 확인 프레임 |
 | `vehicle_width_m` | 0.38 | 차량 폭 |
 | `minimum_side_clearance_m` | 0.05 | 최소 측면 여유 |
+| `exit_wait_after_park_sec` | 2.0 | 주차 완료 후 출차 전 정지 |
+| `exit_forward_duration_sec` | 3.0 | 출차 첫 직진 시간 |
+| `exit_right_turn_duration_sec` | 10.0 | 최대 우조향 전진 시간 |
+| `exit_final_forward_duration_sec` | 10.0 | 출차 마지막 직진 시간 |
+| `exit_right_steer_deg` | 45 | 출차 우조향각 |
+| `exit_speed` | 110 | 출차 전진 속도 |
 
 ## 디버그 화면
 
@@ -235,6 +254,16 @@ pair 처리:
 - 상단 `cmd steer/speed`: 마지막 `/motor_control` 명령
 - `phase`: 현재 세부 후진 단계
 - `pair=STRICT/FALLBACK`: pair 선택 방식
+
+## 하이카메라 관련 현재 상태
+
+- 현재 실제 주차 제어는 LiDAR만 사용한다.
+- 생성되는 ROS 구독은 `/scan` 하나뿐이며 하이카메라 구독은 생성하지 않는다.
+- 따라서 하이카메라 콜백, 흰 실선 검출, 교차점 계산, 카메라 조향은 실행되지 않는다.
+- `camera_debug_image`도 채워지지 않으므로 하이카메라 창은 뜨지 않는다.
+- 다만 이전 실험에서 추가했던 `CvBridge`, `Image`, 카메라 파라미터, 실선 검출 함수와 디버그 표시 코드가 파일에 죽은 코드로 남아 있다.
+- 이 잔여 코드는 주행 명령에는 영향을 주지 않지만 `cv_bridge` import/초기화 의존성은 만든다.
+- 다음 세션에서 사용자가 정리를 요청하면 카메라 잔여 코드만 제거하되 LiDAR 주차 시퀀스는 변경하지 않는다.
 
 ## 실차 rosbag 분석 기록
 
@@ -307,7 +336,7 @@ ros2 bag record -o parking_test_06 \
 1. `parking/parking/yym.md`와 실제 `parking_node_yym.py`를 함께 읽는다.
 2. `git status --short`로 기존 사용자 변경사항을 확인하고 보존한다.
 3. 별도 허가가 없다면 `parking_node_yym.py` 외 파일을 수정하지 않는다.
-4. 5초 이전 로직은 잘 작동했다는 사용자 평가가 있으므로 변경 전 근거를 확인한다.
+4. 5초 정지 전 조향은 현재 `중점 각도×10 + gap-facing 경계 기울기×5`다. 별도 요청 없이 변경하지 않는다.
 5. 5초 이후 수정 시 빨간선 보정이 차량 기울기보다 우선이라는 요구를 유지한다.
 6. 최종 보정은 현재 0.5초씩 2회이며 각 회차 사이 반드시 정지·재측정한다.
 7. 두 번째 보정 후 반드시 정지하고 조향 0 정렬 뒤 연속 후진한다.
@@ -315,4 +344,5 @@ ros2 bag record -o parking_test_06 \
 9. `git diff --check -- parking/parking/parking_node_yym.py`로 형식을 검사한다.
 10. `colcon build --packages-select parking --symlink-install`로 빌드한다.
 11. 실차 테스트 시 사진과 `/scan`, `/motor_control`, `/arduino/steering_raw` rosbag을 같은 번호로 남긴다.
-
+12. 사용자는 코드 수정 답변마다 빌드/실행 명령어도 함께 받기를 원한다.
+13. 현재 주차 완료 후 출차가 자동 활성화되어 있으므로 실차 주변 안전 공간을 먼저 확인한다.
