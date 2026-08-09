@@ -204,7 +204,7 @@ class ParkingNodeYym(Node):
         self.declare_parameter('exit_wait_after_park_sec', 4.0)
         self.declare_parameter('exit_forward_duration_sec', 3.0)
         self.declare_parameter('exit_right_turn_duration_sec', 10.0)
-        self.declare_parameter('exit_final_forward_duration_sec', 15.0)
+        self.declare_parameter('exit_final_forward_duration_sec', 20.0)
         self.declare_parameter('exit_right_steer_deg', 45)
         self.declare_parameter('exit_speed', 110)
         # Real-vehicle testing showed the raw geometric angle was too weak.

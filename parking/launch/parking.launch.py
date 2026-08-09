@@ -38,7 +38,7 @@ def generate_launch_description() -> LaunchDescription:
                 'steer_pid_ki': 0.0,
                 'steer_pid_kd': 0.0,
                 'steer_max_angle_deg': 45.0,
-                'steer_angle_tolerance_deg': 1.0,
+                'steer_angle_tolerance_deg': 0.675,
                 'steering_feedback_timeout_sec': 0.5,
             }],
         ),
