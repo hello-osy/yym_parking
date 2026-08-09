@@ -201,7 +201,7 @@ class ParkingNodeYym(Node):
         self.declare_parameter('lidar_side_far_half_width_deg', 5.0)
         self.declare_parameter('lidar_side_far_confirm_frames', 3)
         self.declare_parameter('lidar_side_far_stop_sec', 4.0)
-        self.declare_parameter('exit_wait_after_park_sec', 2.0)
+        self.declare_parameter('exit_wait_after_park_sec', 4.0)
         self.declare_parameter('exit_forward_duration_sec', 3.0)
         self.declare_parameter('exit_right_turn_duration_sec', 10.0)
         self.declare_parameter('exit_final_forward_duration_sec', 15.0)
@@ -231,6 +231,7 @@ class ParkingNodeYym(Node):
             'longest_edge_correction_segment_count', 1
         )
         self.declare_parameter('steer_settle_sec', 0.6)
+        self.declare_parameter('final_zero_steer_settle_sec', 2.0)
         # Recognition test: after steering settles at -45 degrees, drive for
         # this calibrated duration with maximum left steering, then stop.
         self.declare_parameter('left_turn_duration_sec', 7.0)
@@ -511,6 +512,9 @@ class ParkingNodeYym(Node):
             + self.longest_edge_correction_segment_count
         )
         self.steer_settle_sec = float(self._value('steer_settle_sec'))
+        self.final_zero_steer_settle_sec = max(
+            0.1, float(self._value('final_zero_steer_settle_sec'))
+        )
         self.left_turn_duration_sec = max(
             0.1, float(self._value('left_turn_duration_sec'))
         )
@@ -2274,7 +2278,7 @@ class ParkingNodeYym(Node):
 
                 if self.reverse_phase == 'FINAL_ZERO_STEER_SETTLE':
                     self.publish_control(0, 0)
-                    if phase_elapsed >= self.steer_settle_sec:
+                    if phase_elapsed >= self.final_zero_steer_settle_sec:
                         self.reverse_phase = 'FINAL_STRAIGHT_DRIVE'
                         self.reverse_phase_started_at = now
                         self.publish_control(0, self.reverse_speed)
